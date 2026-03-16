@@ -182,6 +182,57 @@ codex-register-v2/
 | `ws://host/api/ws/task/{uuid}` | 单任务实时日志 |
 | `ws://host/api/ws/batch/{id}` | 批量任务实时状态 |
 
+## Docker 部署
+
+### 环境要求
+
+- Docker
+- Docker Compose
+
+### 快速部署
+
+```bash
+# 克隆项目
+git clone https://github.com/cnlimiter/codex-register.git
+cd codex-register
+
+# 启动服务
+docker-compose up -d
+```
+
+服务启动后访问 http://localhost:8000
+
+### 配置说明
+
+**端口映射**：默认 `8000` 端口，可在 `docker-compose.yml` 中修改。
+
+**数据持久化**：
+```yaml
+volumes:
+  - ./data:/app/data
+  - ./logs:/app/logs
+```
+
+**代理配置**：
+```yaml
+environment:
+  - HTTP_PROXY=http://your-proxy:port
+  - HTTPS_PROXY=http://your-proxy:port
+```
+
+### 常用命令
+
+```bash
+# 查看日志
+docker-compose logs -f
+
+# 停止服务
+docker-compose down
+
+# 重新构建
+docker-compose build --no-cache
+```
+
 ## 注意事项
 
 - 首次运行会自动创建 `data/` 目录和 SQLite 数据库
