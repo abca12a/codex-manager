@@ -8,6 +8,7 @@ import re
 import time
 import json
 import logging
+from datetime import datetime, timezone
 from email import message_from_string
 from email.header import decode_header, make_header
 from email.message import Message
@@ -67,6 +68,71 @@ class TempMailService(BaseEmailService):
 
         # 邮箱缓存：email -> {jwt, address}
         self._email_cache: Dict[str, Dict[str, Any]] = {}
+        self.debug_callback = None
+        self._last_debug_events: List[str] = []
+
+    def _emit_debug(self, message: str) -> None:
+        """记录调试日志，并在需要时透传给注册流程。"""
+        logger.info(message)
+        self._last_debug_events.append(message)
+        callback = getattr(self, "debug_callback", None)
+        if callable(callback):
+            callback(f"[TempMail] {message}")
+
+    def consume_debug_events(self) -> List[str]:
+        """取出本次验证码轮询收集到的调试日志。"""
+        events = list(self._last_debug_events)
+        self._last_debug_events = []
+        return events
+
+    def _parse_mail_timestamp(self, value: Any) -> Optional[float]:
+        """解析邮件时间戳，Worker 无时区字段时按 UTC 处理。"""
+        if value in (None, ""):
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        if text.isdigit():
+            return float(text)
+
+        candidates = [text]
+        if " " in text and "T" not in text:
+            candidates.append(text.replace(" ", "T"))
+
+        formats = (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+        )
+
+        for candidate in candidates:
+            try:
+                if candidate.endswith("Z"):
+                    normalized = candidate[:-1] + "+00:00"
+                    return datetime.fromisoformat(normalized).timestamp()
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+            except ValueError:
+                pass
+
+            for fmt in formats:
+                try:
+                    parsed = datetime.strptime(candidate, fmt)
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                    return parsed.timestamp()
+                except ValueError:
+                    continue
+
+        return None
 
     def _decode_mime_header(self, value: str) -> str:
         """解码 MIME 头，兼容 RFC 2047 编码主题。"""
@@ -294,6 +360,10 @@ class TempMailService(BaseEmailService):
             验证码字符串，超时返回 None
         """
         logger.info(f"正在从 TempMail 邮箱 {email} 获取验证码...")
+        self._last_debug_events = []
+        self._emit_debug(
+            f"开始轮询邮箱 {email}，timeout={timeout}s，otp_sent_at={otp_sent_at or 0}"
+        )
 
         start_time = time.time()
         seen_mail_ids: set = set()
@@ -324,12 +394,26 @@ class TempMailService(BaseEmailService):
                     time.sleep(3)
                     continue
 
+                mail_candidates = []
                 for mail in mails:
+                    created_raw = mail.get("createdAt") or mail.get("created_at")
+                    created_ts = self._parse_mail_timestamp(created_raw)
+                    mail_candidates.append((created_ts, created_raw, mail))
+
+                mail_candidates.sort(
+                    key=lambda item: (
+                        item[0] is not None,
+                        item[0] if item[0] is not None else float("-inf"),
+                    ),
+                    reverse=True,
+                )
+
+                self._emit_debug(f"本轮拉取到 {len(mail_candidates)} 封邮件")
+
+                for created_ts, created_raw, mail in mail_candidates:
                     mail_id = mail.get("id")
                     if not mail_id or mail_id in seen_mail_ids:
                         continue
-
-                    seen_mail_ids.add(mail_id)
 
                     parsed = self._extract_mail_fields(mail)
                     sender = parsed["sender"].lower()
@@ -337,24 +421,47 @@ class TempMailService(BaseEmailService):
                     body_text = parsed["body"]
                     raw_text = parsed["raw"]
                     content = f"{sender}\n{subject}\n{body_text}\n{raw_text}".strip()
+                    subject_preview = subject[:120] or "(empty subject)"
+                    created_preview = str(created_raw or "unknown")
+
+                    if otp_sent_at and created_ts and created_ts + 1 < otp_sent_at:
+                        seen_mail_ids.add(mail_id)
+                        self._emit_debug(
+                            f"跳过旧邮件 id={mail_id} created_at={created_preview} subject={subject_preview}"
+                        )
+                        continue
 
                     # 只处理 OpenAI 邮件
                     if "openai" not in sender and "openai" not in content.lower():
+                        seen_mail_ids.add(mail_id)
                         continue
 
+                    seen_mail_ids.add(mail_id)
+                    self._emit_debug(
+                        f"检查候选邮件 id={mail_id} created_at={created_preview} subject={subject_preview}"
+                    )
                     match = re.search(pattern, content)
                     if match:
                         code = match.group(1)
+                        self._emit_debug(
+                            f"命中验证码邮件 id={mail_id} created_at={created_preview} code={code}"
+                        )
                         logger.info(f"从 TempMail 邮箱 {email} 找到验证码: {code}")
                         self.update_status(True)
                         return code
 
+                    self._emit_debug(
+                        f"候选邮件未提取到验证码 id={mail_id} created_at={created_preview}"
+                    )
+
             except Exception as e:
                 logger.debug(f"检查 TempMail 邮件时出错: {e}")
+                self._emit_debug(f"轮询邮件异常: {e}")
 
             time.sleep(3)
 
         logger.warning(f"等待 TempMail 验证码超时: {email}")
+        self._emit_debug(f"等待验证码超时: {email}")
         return None
 
     def list_emails(self, limit: int = 100, offset: int = 0, **kwargs) -> List[Dict[str, Any]]:

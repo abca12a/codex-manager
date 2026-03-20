@@ -1,6 +1,7 @@
 import base64
 import json
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,6 +14,7 @@ from src.core.register import (
     _decode_auth_cookie_payload,
     _extract_workspace_candidates,
 )
+from src.services.temp_mail import TempMailService
 
 
 def _make_auth_cookie(payload: dict) -> str:
@@ -76,6 +78,61 @@ class RegisterWorkspaceTests(unittest.TestCase):
             self.assertIsNotNone(updated)
             self.assertEqual(updated.account_id, "openai-acct-1")
             self.assertEqual(updated.workspace_id, "ws-openai-1")
+
+    def test_temp_mail_verification_code_skips_mail_older_than_otp_sent_at(self):
+        class DummyTempMailService(TempMailService):
+            def __init__(self):
+                self.service_type = SimpleNamespace(value="temp_mail")
+                self.name = "dummy"
+                self._status = None
+                self._last_error = None
+                self.config = {
+                    "base_url": "https://example.com",
+                    "admin_password": "secret",
+                    "domain": "example.com",
+                    "enable_prefix": True,
+                    "timeout": 30,
+                    "max_retries": 3,
+                }
+                self._email_cache = {}
+                self.requests = 0
+
+            def update_status(self, success: bool, error: Exception = None):
+                self._last_error = str(error) if error else None
+
+            def _make_request(self, method: str, path: str, **kwargs):
+                self.requests += 1
+                if self.requests > 1:
+                    raise AssertionError("should stop after finding the new otp mail")
+                return {
+                    "results": [
+                        {
+                            "id": "old-mail",
+                            "createdAt": "2026-03-21 03:49:50",
+                            "source": "noreply@tm.openai.com",
+                            "subject": "Your OpenAI code is 586367",
+                            "text": "Your OpenAI code is 586367",
+                        },
+                        {
+                            "id": "new-mail",
+                            "createdAt": "2026-03-21 03:50:00",
+                            "source": "noreply@tm.openai.com",
+                            "subject": "Your OpenAI code is 076148",
+                            "text": "Your OpenAI code is 076148",
+                        },
+                    ]
+                }
+
+        service = DummyTempMailService()
+        otp_sent_at = datetime(2026, 3, 21, 3, 49, 59, tzinfo=timezone.utc).timestamp()
+
+        code = service.get_verification_code(
+            email="tmpvmdcq26izc@example.com",
+            timeout=1,
+            otp_sent_at=otp_sent_at,
+        )
+
+        self.assertEqual(code, "076148")
 
     def test_run_uses_create_account_continue_url_without_workspace_lookup(self):
         class DummyEngine(RegistrationEngine):

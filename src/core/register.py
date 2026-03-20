@@ -214,6 +214,8 @@ class RegistrationEngine:
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
+        if hasattr(self.email_service, "debug_callback"):
+            setattr(self.email_service, "debug_callback", self._log)
 
         # 创建 HTTP 客户端
         self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
