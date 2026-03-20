@@ -464,10 +464,20 @@ class RegistrationEngine:
             try:
                 response_data = response.json()
                 page_type = response_data.get("page", {}).get("type", "")
+                top_level_keys = ", ".join(sorted(response_data.keys())[:12]) or "(empty)"
+                continue_url = str(response_data.get("continue_url") or "").strip()
+                continue_method = str(response_data.get("method") or "GET").strip().upper() or "GET"
+                self._log(f"authorize/continue 响应字段: {top_level_keys}")
                 self._log(f"响应页面类型: {page_type}")
+                if continue_url:
+                    self._log(f"authorize/continue Continue URL: {continue_url[:100]}...")
+                    self._log(f"authorize/continue Continue Method: {continue_method}")
 
                 # 判断是否为已注册账号
-                is_existing = page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
+                is_existing = page_type in (
+                    OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
+                    OPENAI_PAGE_TYPES["LOGIN_PASSWORD"],
+                )
 
                 if is_existing:
                     self._log(f"检测到已注册账号，将自动切换到登录流程")
@@ -488,6 +498,131 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"提交注册表单失败: {e}", "error")
             return SignupFormResult(success=False, error_message=str(e))
+
+    def _submit_login_identifier(self, did: str, sen_token: Optional[str]) -> SignupFormResult:
+        """已有账号补跑时，先提交登录邮箱标识。"""
+        try:
+            login_body = json.dumps({
+                "username": {
+                    "value": self.email,
+                    "kind": "email",
+                }
+            })
+
+            headers = {
+                "referer": "https://auth.openai.com/log-in",
+                "accept": "application/json",
+                "content-type": "application/json",
+            }
+
+            if sen_token:
+                sentinel = f'{{"p": "", "t": "", "c": "{sen_token}", "id": "{did}", "flow": "authorize_continue"}}'
+                headers["openai-sentinel-token"] = sentinel
+
+            response = self.session.post(
+                OPENAI_API_ENDPOINTS["signup"],
+                headers=headers,
+                data=login_body,
+            )
+
+            self._log(f"提交登录标识状态: {response.status_code}")
+
+            if response.status_code != 200:
+                return SignupFormResult(
+                    success=False,
+                    error_message=f"HTTP {response.status_code}: {response.text[:200]}",
+                )
+
+            try:
+                response_data = response.json()
+                page_type = str((response_data.get("page") or {}).get("type") or "").strip()
+                top_level_keys = ", ".join(sorted(response_data.keys())[:12]) or "(empty)"
+                continue_url, continue_method = self._extract_continue_context(response_data)
+                self._log(f"登录标识响应字段: {top_level_keys}")
+                self._log(f"登录标识页面类型: {page_type}")
+                if continue_url:
+                    self._log(f"登录标识 Continue URL: {continue_url[:100]}...")
+                    self._log(f"登录标识 Continue Method: {continue_method}")
+
+                is_existing = page_type in (
+                    OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
+                    OPENAI_PAGE_TYPES["LOGIN_PASSWORD"],
+                )
+                if is_existing:
+                    self._is_existing_account = True
+                    self._log("登录标识确认该邮箱已存在，将继续登录流程")
+                else:
+                    self._log("登录标识未进入已有账号页面，后续可能需要人工确认该邮箱状态", "warning")
+
+                return SignupFormResult(
+                    success=True,
+                    page_type=page_type,
+                    is_existing_account=is_existing,
+                    response_data=response_data,
+                )
+            except Exception as parse_error:
+                self._log(f"解析登录标识响应失败: {parse_error}", "warning")
+                return SignupFormResult(success=True)
+
+        except Exception as e:
+            self._log(f"提交登录标识失败: {e}", "error")
+            return SignupFormResult(success=False, error_message=str(e))
+
+    def _extract_continue_context(
+        self,
+        response_data: Optional[Dict[str, Any]],
+    ) -> Tuple[str, str]:
+        """从响应体中提取 Continue URL 与请求方法。"""
+        if not isinstance(response_data, dict):
+            return "", "GET"
+
+        continue_url = str(response_data.get("continue_url") or "").strip()
+        continue_method = str(response_data.get("method") or "GET").strip().upper() or "GET"
+        return continue_url, continue_method
+
+    def _send_passwordless_login_otp(self, referer_url: str = "") -> bool:
+        """已有账号在登录页切换为邮箱 OTP 登录。"""
+        try:
+            self._otp_sent_at = time.time()
+            referer = str(referer_url or "").strip() or "https://auth.openai.com/log-in/password"
+
+            response = self.session.post(
+                OPENAI_API_ENDPOINTS["send_passwordless_otp"],
+                headers={
+                    "referer": referer,
+                    "accept": "application/json",
+                },
+                data="",
+            )
+
+            self._log(f"登录 OTP 发送状态: {response.status_code}")
+
+            response_preview = (response.text or "")[:500]
+            if response.status_code != 200:
+                self._log(f"登录 OTP 发送失败响应: {response_preview}", "warning")
+                return False
+
+            try:
+                response_data = response.json()
+                top_level_keys = ", ".join(sorted(response_data.keys())[:12]) or "(empty)"
+                page_type = str((response_data.get("page") or {}).get("type") or "").strip()
+                continue_url, continue_method = self._extract_continue_context(response_data)
+                self._log(f"登录 OTP 响应字段: {top_level_keys}")
+                if page_type:
+                    self._log(f"登录 OTP 页面类型: {page_type}")
+                if continue_url:
+                    self._log(f"登录 OTP Continue URL: {continue_url[:100]}...")
+                    self._log(f"登录 OTP Continue Method: {continue_method}")
+            except Exception as parse_error:
+                self._log(f"解析登录 OTP 响应失败: {parse_error}", "warning")
+                if response_preview:
+                    self._log(f"登录 OTP 原始响应预览: {response_preview}", "warning")
+
+            return True
+
+        except Exception as e:
+            self._log(f"发送登录 OTP 失败: {e}", "error")
+            return False
 
     def _register_password(self, password: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """注册密码"""
@@ -628,6 +763,8 @@ class RegistrationEngine:
             )
 
             self._log(f"验证码校验状态: {response.status_code}")
+            if response.status_code != 200:
+                self._log(f"验证码校验失败响应: {response.text[:500]}", "warning")
             return response.status_code == 200
 
         except Exception as e:
@@ -1002,9 +1139,17 @@ class RegistrationEngine:
             if not signup_result.success:
                 result.error_message = f"提交注册表单失败: {signup_result.error_message}"
                 return result
+            login_continue_url, _ = self._extract_continue_context(signup_result.response_data)
+            is_login_password_flow = signup_result.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]
+            is_existing_login_flow = self._is_existing_account or is_login_password_flow
 
-            # 8. [已注册账号跳过] 注册密码
-            if self._is_existing_account:
+            # 8. 已注册账号登录分支 / 新账号注册密码
+            if is_login_password_flow:
+                self._log("8. [已注册账号] 检测到登录密码页，切换为邮箱 OTP 登录...")
+                if not self._send_passwordless_login_otp(login_continue_url):
+                    result.error_message = "发送登录 OTP 失败"
+                    return result
+            elif self._is_existing_account:
                 self._log("8. [已注册账号] 跳过密码设置，OTP 已自动发送")
             else:
                 self._log("8. 注册密码...")
@@ -1014,7 +1159,9 @@ class RegistrationEngine:
                     return result
 
             # 9. [已注册账号跳过] 发送验证码
-            if self._is_existing_account:
+            if is_login_password_flow:
+                self._log("9. [已注册账号] 已触发登录 OTP，等待邮箱验证码")
+            elif self._is_existing_account:
                 self._log("9. [已注册账号] 跳过发送验证码，使用自动发送的 OTP")
                 # 已注册账号的 OTP 在提交表单时已自动发送，记录时间戳
                 self._otp_sent_at = time.time()
@@ -1041,7 +1188,7 @@ class RegistrationEngine:
             continue_method = "GET"
 
             # 12. [已注册账号跳过] 创建用户账户
-            if self._is_existing_account:
+            if is_existing_login_flow:
                 self._log("12. [已注册账号] 跳过创建用户账户")
             else:
                 self._log("12. 创建用户账户...")
@@ -1097,7 +1244,7 @@ class RegistrationEngine:
                 self._log("Workspace ID 缺失，回退使用 Account ID", "warning")
 
             # 设置来源标记
-            result.source = "login" if self._is_existing_account else "register"
+            result.source = "login" if is_existing_login_flow else "register"
 
             # 尝试获取 session_token 从 cookie
             session_cookie = None
@@ -1110,7 +1257,7 @@ class RegistrationEngine:
 
             # 17. 完成
             self._log("=" * 60)
-            if self._is_existing_account:
+            if is_existing_login_flow:
                 self._log("登录成功! (已注册账号)")
             else:
                 self._log("注册成功!")
@@ -1124,7 +1271,7 @@ class RegistrationEngine:
                 "email_service": self.email_service.service_type.value,
                 "proxy_used": self.proxy_url,
                 "registered_at": datetime.now().isoformat(),
-                "is_existing_account": self._is_existing_account,
+                "is_existing_account": is_existing_login_flow,
             }
 
             return result
@@ -1208,15 +1355,23 @@ class RegistrationEngine:
             else:
                 self._log("Sentinel 检查失败或未启用", "warning")
 
-            # 7. 提交注册表单
-            self._log("7. 提交注册表单...")
-            signup_result = self._submit_signup_form(did, sen_token)
+            # 7. 提交登录标识
+            self._log("7. 提交登录标识...")
+            signup_result = self._submit_login_identifier(did, sen_token)
             if not signup_result.success:
-                result.error_message = f"提交注册表单失败: {signup_result.error_message}"
+                result.error_message = f"提交登录标识失败: {signup_result.error_message}"
                 return result
+            login_continue_url, _ = self._extract_continue_context(signup_result.response_data)
+            is_login_password_flow = signup_result.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]
+            is_existing_login_flow = self._is_existing_account or is_login_password_flow
 
-            # 8. 已注册账号跳过；否则尝试复用已有密码
-            if self._is_existing_account:
+            # 8. 已注册账号登录分支 / 其余流程
+            if is_login_password_flow:
+                self._log("8. [已有账号] 命中登录密码页，改走邮箱 OTP 登录...")
+                if not self._send_passwordless_login_otp(login_continue_url):
+                    result.error_message = "发送登录 OTP 失败"
+                    return result
+            elif self._is_existing_account:
                 self._log("8. [已注册账号] 跳过密码设置，OTP 已自动发送")
             else:
                 if self.password:
@@ -1231,7 +1386,9 @@ class RegistrationEngine:
                     return result
 
             # 9. 发送验证码
-            if self._is_existing_account:
+            if is_login_password_flow:
+                self._log("9. [已有账号] 已触发登录 OTP，等待邮箱验证码")
+            elif self._is_existing_account:
                 self._log("9. [已注册账号] 跳过发送验证码，使用自动发送的 OTP")
                 self._otp_sent_at = time.time()
             else:
@@ -1257,7 +1414,7 @@ class RegistrationEngine:
             continue_method = "GET"
 
             # 12. 已注册账号跳过创建用户；否则沿用现有流程继续补全
-            if self._is_existing_account:
+            if is_existing_login_flow:
                 self._log("12. [已注册账号] 跳过创建用户账户")
             else:
                 self._log("12. 创建用户账户...")
@@ -1309,7 +1466,7 @@ class RegistrationEngine:
                 result.workspace_id = result.account_id
                 self._log("Workspace ID 缺失，回退使用 Account ID", "warning")
 
-            result.source = "login" if self._is_existing_account else "register"
+            result.source = "login" if is_existing_login_flow else "register"
 
             session_cookie = None
             if self.session and getattr(self.session, "cookies", None):
@@ -1320,7 +1477,7 @@ class RegistrationEngine:
                 self._log("获取到 Session Token")
 
             self._log("=" * 60)
-            if self._is_existing_account:
+            if is_existing_login_flow:
                 self._log("已有账号补跑成功! (登录流程)")
             else:
                 self._log("已有账号补跑成功! (补全注册流程)")
@@ -1334,7 +1491,7 @@ class RegistrationEngine:
                 "email_service": self.email_service.service_type.value,
                 "proxy_used": self.proxy_url,
                 "registered_at": datetime.now().isoformat(),
-                "is_existing_account": self._is_existing_account,
+                "is_existing_account": is_existing_login_flow,
                 "retry_mode": "existing_account",
             }
 

@@ -65,6 +65,7 @@ OPENAI_API_ENDPOINTS = {
     "signup": "https://auth.openai.com/api/accounts/authorize/continue",
     "register": "https://auth.openai.com/api/accounts/user/register",
     "send_otp": "https://auth.openai.com/api/accounts/email-otp/send",
+    "send_passwordless_otp": "https://auth.openai.com/api/accounts/passwordless/send-otp",
     "validate_otp": "https://auth.openai.com/api/accounts/email-otp/validate",
     "create_account": "https://auth.openai.com/api/accounts/create_account",
     "select_workspace": "https://auth.openai.com/api/accounts/workspace/select",
@@ -73,6 +74,7 @@ OPENAI_API_ENDPOINTS = {
 # OpenAI 页面类型（用于判断账号状态）
 OPENAI_PAGE_TYPES = {
     "EMAIL_OTP_VERIFICATION": "email_otp_verification",  # 已注册账号，需要 OTP 验证
+    "LOGIN_PASSWORD": "login_password",  # 已注册账号，先到密码页，可切换为邮箱 OTP 登录
     "PASSWORD_REGISTRATION": "password",  # 新账号，需要设置密码
 }
 
