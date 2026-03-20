@@ -627,6 +627,40 @@ class RegistrationEngine:
             self._log(f"解析 HTML 下一跳失败: {e}", "warning")
             return None
 
+    def _log_html_debug_info(self, current_url: str, html: str) -> None:
+        """记录 HTML 页面的调试摘要。"""
+        try:
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+            title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+            if title:
+                self._log(f"HTML 标题: {title}", "warning")
+
+            form_matches = list(
+                re.finditer(
+                    r"<form[^>]*action=[\"']([^\"']*)[\"'][^>]*>(.*?)</form>",
+                    html,
+                    re.IGNORECASE | re.DOTALL,
+                )
+            )
+            self._log(f"HTML 表单数量: {len(form_matches)}", "warning")
+            for index, match in enumerate(form_matches[:2], start=1):
+                action = urllib.parse.urljoin(current_url, (match.group(1) or "").strip())
+                inner_html = match.group(2) or ""
+                input_names = re.findall(
+                    r"<input[^>]*name=[\"']([^\"']+)[\"']",
+                    inner_html,
+                    re.IGNORECASE,
+                )
+                names_preview = ", ".join(input_names[:8]) or "(none)"
+                self._log(f"HTML 表单{index} action: {action[:120]}", "warning")
+                self._log(f"HTML 表单{index} inputs: {names_preview}", "warning")
+
+            snippet = re.sub(r"\s+", " ", html[:600]).strip()
+            if snippet:
+                self._log(f"HTML 片段: {snippet[:300]}", "warning")
+        except Exception as e:
+            self._log(f"记录 HTML 调试信息失败: {e}", "warning")
+
     def _create_user_account(self) -> CreateAccountResult:
         """创建用户账户"""
         try:
@@ -795,6 +829,10 @@ class RegistrationEngine:
                     self._log(f"非重定向状态码: {response.status_code}")
                     content_type = response.headers.get("Content-Type") or ""
                     self._log(f"响应 Content-Type: {content_type or '(empty)'}", "warning")
+                    if "text/html" in content_type.lower():
+                        self._log_html_debug_info(current_url, response.text or "")
+                        if "/add-phone" in current_url:
+                            self._log("检测到 add-phone 页面，当前流程可能被手机号验证拦截", "error")
                     next_url = self._extract_next_url_from_html(current_url, response.text or "")
                     if next_url:
                         if "code=" in next_url and "state=" in next_url:
