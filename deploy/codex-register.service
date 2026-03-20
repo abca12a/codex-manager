@@ -1,0 +1,16 @@
+[Unit]
+Description=codex-register Web UI
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/codex-register
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/root/codex-register/.env
+ExecStart=/root/codex-register/.venv/bin/python /root/codex-register/webui.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
