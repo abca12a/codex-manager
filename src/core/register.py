@@ -298,6 +298,49 @@ class RegistrationEngine:
             self._log(f"创建邮箱失败: {e}", "error")
             return False
 
+    def _prepare_existing_email(
+        self,
+        email: str,
+        password: Optional[str] = None,
+        email_service_id: Optional[str] = None,
+    ) -> bool:
+        """复用已有邮箱和密码上下文。"""
+        normalized_email = str(email or "").strip()
+        if not normalized_email:
+            self._log("复用已有邮箱失败: 邮箱为空", "error")
+            return False
+
+        self.email = normalized_email
+        self.password = password or None
+        service_id = str(email_service_id or normalized_email).strip() or normalized_email
+        self.email_info = {
+            "email": normalized_email,
+            "service_id": service_id,
+            "id": service_id,
+            "reused_existing_account": True,
+        }
+
+        self._log(f"复用已有邮箱: {self.email}")
+        if self.password:
+            self._log(f"复用已有密码，长度: {len(self.password)}")
+        else:
+            self._log("未提供已有密码，后续如需设置密码将回退为随机生成", "warning")
+
+        return True
+
+    def _reset_flow_state(self, keep_identity: bool = False) -> None:
+        """重置单次流程状态，支持同一个引擎实例重复运行。"""
+        self.logs = []
+        self._otp_sent_at = None
+        self._is_existing_account = False
+        self.session = None
+        self.session_token = None
+        self.oauth_start = None
+        if not keep_identity:
+            self.email = None
+            self.password = None
+            self.email_info = None
+
     def _start_oauth(self) -> bool:
         """开始 OAuth 流程"""
         try:
@@ -446,13 +489,17 @@ class RegistrationEngine:
             self._log(f"提交注册表单失败: {e}", "error")
             return SignupFormResult(success=False, error_message=str(e))
 
-    def _register_password(self) -> Tuple[bool, Optional[str]]:
+    def _register_password(self, password: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """注册密码"""
         try:
-            # 生成密码
-            password = self._generate_password()
+            # 复用已有密码，否则生成新密码
+            password = password or self._generate_password()
             self.password = password  # 保存密码到实例变量
-            self._log(f"生成密码: {password}")
+            if password == self.password and password:
+                if self.email_info and self.email_info.get("reused_existing_account"):
+                    self._log(f"复用密码提交注册，长度: {len(password)}")
+                else:
+                    self._log(f"生成密码: {password}")
 
             # 提交密码注册
             register_body = json.dumps({
@@ -896,6 +943,7 @@ class RegistrationEngine:
         Returns:
             RegistrationResult: 注册结果
         """
+        self._reset_flow_state()
         result = RegistrationResult(success=False, logs=self.logs)
 
         try:
@@ -1052,7 +1100,9 @@ class RegistrationEngine:
             result.source = "login" if self._is_existing_account else "register"
 
             # 尝试获取 session_token 从 cookie
-            session_cookie = self.session.cookies.get("__Secure-next-auth.session-token")
+            session_cookie = None
+            if self.session and getattr(self.session, "cookies", None):
+                session_cookie = self.session.cookies.get("__Secure-next-auth.session-token")
             if session_cookie:
                 self.session_token = session_cookie
                 result.session_token = session_cookie
@@ -1081,6 +1131,217 @@ class RegistrationEngine:
 
         except Exception as e:
             self._log(f"注册过程中发生未预期错误: {e}", "error")
+            result.error_message = str(e)
+            return result
+
+    def run_existing_account(
+        self,
+        email: str,
+        password: Optional[str] = None,
+        email_service_id: Optional[str] = None,
+    ) -> RegistrationResult:
+        """
+        复用已有失败账号的邮箱/密码重新推进流程。
+
+        Args:
+            email: 已存在的邮箱地址
+            password: 已保存的密码
+            email_service_id: 邮箱服务中的 ID
+
+        Returns:
+            RegistrationResult: 补跑结果
+        """
+        self._reset_flow_state()
+        result = RegistrationResult(success=False, logs=self.logs)
+
+        try:
+            self._log("=" * 60)
+            self._log("开始已有账号补跑流程")
+            self._log("=" * 60)
+
+            # 1. 检查 IP 地理位置
+            self._log("1. 检查 IP 地理位置...")
+            ip_ok, location = self._check_ip_location()
+            if not ip_ok:
+                result.error_message = f"IP 地理位置不支持: {location}"
+                self._log(f"IP 检查失败: {location}", "error")
+                return result
+
+            self._log(f"IP 位置: {location}")
+
+            # 2. 复用邮箱信息
+            self._log("2. 复用已有邮箱信息...")
+            if not self._prepare_existing_email(
+                email=email,
+                password=password,
+                email_service_id=email_service_id,
+            ):
+                result.error_message = "复用已有邮箱失败"
+                return result
+
+            result.email = self.email or ""
+
+            # 3. 初始化会话
+            self._log("3. 初始化会话...")
+            if not self._init_session():
+                result.error_message = "初始化会话失败"
+                return result
+
+            # 4. 开始 OAuth 流程
+            self._log("4. 开始 OAuth 授权流程...")
+            if not self._start_oauth():
+                result.error_message = "开始 OAuth 流程失败"
+                return result
+
+            # 5. 获取 Device ID
+            self._log("5. 获取 Device ID...")
+            did = self._get_device_id()
+            if not did:
+                result.error_message = "获取 Device ID 失败"
+                return result
+
+            # 6. 检查 Sentinel 拦截
+            self._log("6. 检查 Sentinel 拦截...")
+            sen_token = self._check_sentinel(did)
+            if sen_token:
+                self._log("Sentinel 检查通过")
+            else:
+                self._log("Sentinel 检查失败或未启用", "warning")
+
+            # 7. 提交注册表单
+            self._log("7. 提交注册表单...")
+            signup_result = self._submit_signup_form(did, sen_token)
+            if not signup_result.success:
+                result.error_message = f"提交注册表单失败: {signup_result.error_message}"
+                return result
+
+            # 8. 已注册账号跳过；否则尝试复用已有密码
+            if self._is_existing_account:
+                self._log("8. [已注册账号] 跳过密码设置，OTP 已自动发送")
+            else:
+                if self.password:
+                    self._log("8. 复用已有密码...")
+                    password_ok, _ = self._register_password(self.password)
+                else:
+                    self._log("8. 已有账号缺少密码，回退生成新密码...")
+                    password_ok, _ = self._register_password()
+
+                if not password_ok:
+                    result.error_message = "注册密码失败"
+                    return result
+
+            # 9. 发送验证码
+            if self._is_existing_account:
+                self._log("9. [已注册账号] 跳过发送验证码，使用自动发送的 OTP")
+                self._otp_sent_at = time.time()
+            else:
+                self._log("9. 发送验证码...")
+                if not self._send_verification_code():
+                    result.error_message = "发送验证码失败"
+                    return result
+
+            # 10. 获取验证码
+            self._log("10. 等待验证码...")
+            code = self._get_verification_code()
+            if not code:
+                result.error_message = "获取验证码失败"
+                return result
+
+            # 11. 验证验证码
+            self._log("11. 验证验证码...")
+            if not self._validate_verification_code(code):
+                result.error_message = "验证验证码失败"
+                return result
+
+            continue_url = ""
+            continue_method = "GET"
+
+            # 12. 已注册账号跳过创建用户；否则沿用现有流程继续补全
+            if self._is_existing_account:
+                self._log("12. [已注册账号] 跳过创建用户账户")
+            else:
+                self._log("12. 创建用户账户...")
+                create_account_result = self._create_user_account()
+                if not create_account_result.success:
+                    result.error_message = "创建用户账户失败"
+                    return result
+                continue_url = create_account_result.continue_url
+                continue_method = create_account_result.continue_method
+
+            if continue_url:
+                self._log("13. 使用 create_account 返回的 Continue URL...")
+            else:
+                self._log("13. 获取 Workspace ID...")
+                workspace_id = self._get_workspace_id()
+                if not workspace_id:
+                    result.error_message = "获取 Workspace ID 失败"
+                    return result
+
+                result.workspace_id = workspace_id
+
+                self._log("14. 选择 Workspace...")
+                continue_url = self._select_workspace(workspace_id)
+                if not continue_url:
+                    result.error_message = "选择 Workspace 失败"
+                    return result
+
+            # 15. 跟随重定向链
+            self._log("15. 跟随重定向链...")
+            callback_url = self._follow_redirects(continue_url, continue_method)
+            if not callback_url:
+                result.error_message = "跟随重定向链失败"
+                return result
+
+            # 16. 处理 OAuth 回调
+            self._log("16. 处理 OAuth 回调...")
+            token_info = self._handle_oauth_callback(callback_url)
+            if not token_info:
+                result.error_message = "处理 OAuth 回调失败"
+                return result
+
+            result.account_id = token_info.get("account_id", "")
+            result.access_token = token_info.get("access_token", "")
+            result.refresh_token = token_info.get("refresh_token", "")
+            result.id_token = token_info.get("id_token", "")
+            result.password = self.password or ""
+
+            if not result.workspace_id and result.account_id:
+                result.workspace_id = result.account_id
+                self._log("Workspace ID 缺失，回退使用 Account ID", "warning")
+
+            result.source = "login" if self._is_existing_account else "register"
+
+            session_cookie = None
+            if self.session and getattr(self.session, "cookies", None):
+                session_cookie = self.session.cookies.get("__Secure-next-auth.session-token")
+            if session_cookie:
+                self.session_token = session_cookie
+                result.session_token = session_cookie
+                self._log("获取到 Session Token")
+
+            self._log("=" * 60)
+            if self._is_existing_account:
+                self._log("已有账号补跑成功! (登录流程)")
+            else:
+                self._log("已有账号补跑成功! (补全注册流程)")
+            self._log(f"邮箱: {result.email}")
+            self._log(f"Account ID: {result.account_id}")
+            self._log(f"Workspace ID: {result.workspace_id}")
+            self._log("=" * 60)
+
+            result.success = True
+            result.metadata = {
+                "email_service": self.email_service.service_type.value,
+                "proxy_used": self.proxy_url,
+                "registered_at": datetime.now().isoformat(),
+                "is_existing_account": self._is_existing_account,
+                "retry_mode": "existing_account",
+            }
+
+            return result
+
+        except Exception as e:
+            self._log(f"补跑过程中发生未预期错误: {e}", "error")
             result.error_message = str(e)
             return result
 
