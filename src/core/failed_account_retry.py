@@ -20,7 +20,7 @@ from ..services import EmailServiceFactory
 from .register import RegistrationEngine, RegistrationResult
 
 
-DEFAULT_FAILED_ACCOUNT_IDS = (3, 4, 5, 6, 7, 8)
+DEFAULT_ACCOUNT_STATUS = AccountStatus.FAILED.value
 
 
 @dataclass
@@ -213,6 +213,37 @@ def _persist_retry_result(
 
     with get_db() as db:
         crud.update_account(db, snapshot["id"], **update_fields)
+
+
+def resolve_target_account_ids(
+    db,
+    account_ids: Optional[Iterable[int]] = None,
+    status: Optional[str] = DEFAULT_ACCOUNT_STATUS,
+    limit: Optional[int] = None,
+) -> list[int]:
+    """解析本次需要补跑的账号 ID 列表。"""
+    if account_ids:
+        normalized_ids: list[int] = []
+        seen_ids: set[int] = set()
+        for raw_id in account_ids:
+            try:
+                account_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if account_id <= 0 or account_id in seen_ids:
+                continue
+            seen_ids.add(account_id)
+            normalized_ids.append(account_id)
+        return normalized_ids
+
+    query_limit = limit or 1000
+    accounts = crud.get_accounts(
+        db,
+        skip=0,
+        limit=query_limit,
+        status=status,
+    )
+    return [account.id for account in accounts]
 
 
 def retry_failed_accounts(

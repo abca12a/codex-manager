@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 from src.database import crud
 from src.database.session import DatabaseSessionManager
+from src.core.failed_account_retry import resolve_target_account_ids
 from src.core.register import (
     CreateAccountResult,
     RegistrationEngine,
@@ -78,6 +79,70 @@ class RegisterWorkspaceTests(unittest.TestCase):
             self.assertIsNotNone(updated)
             self.assertEqual(updated.account_id, "openai-acct-1")
             self.assertEqual(updated.workspace_id, "ws-openai-1")
+
+    def test_resolve_target_account_ids_uses_failed_accounts_when_ids_not_provided(self):
+        manager = DatabaseSessionManager("sqlite:///:memory:")
+        manager.create_tables()
+
+        with manager.session_scope() as db:
+            active = crud.create_account(
+                db,
+                email="active@example.com",
+                email_service="temp_mail",
+                status="active",
+            )
+            failed_1 = crud.create_account(
+                db,
+                email="failed-1@example.com",
+                email_service="temp_mail",
+                status="failed",
+            )
+            failed_2 = crud.create_account(
+                db,
+                email="failed-2@example.com",
+                email_service="temp_mail",
+                status="failed",
+            )
+            active_id = active.id
+            failed_1_id = failed_1.id
+            failed_2_id = failed_2.id
+
+            ids = resolve_target_account_ids(
+                db=db,
+                account_ids=None,
+                status="failed",
+            )
+
+        self.assertNotIn(active_id, ids)
+        self.assertEqual(set(ids), {failed_1_id, failed_2_id})
+
+    def test_resolve_target_account_ids_prefers_explicit_ids(self):
+        manager = DatabaseSessionManager("sqlite:///:memory:")
+        manager.create_tables()
+
+        with manager.session_scope() as db:
+            first = crud.create_account(
+                db,
+                email="first@example.com",
+                email_service="temp_mail",
+                status="failed",
+            )
+            second = crud.create_account(
+                db,
+                email="second@example.com",
+                email_service="temp_mail",
+                status="active",
+            )
+            first_id = first.id
+            second_id = second.id
+
+            ids = resolve_target_account_ids(
+                db=db,
+                account_ids=[second_id, first_id],
+                status="failed",
+            )
+
+        self.assertEqual(ids, [second_id, first_id])
 
     def test_temp_mail_verification_code_skips_mail_older_than_otp_sent_at(self):
         class DummyTempMailService(TempMailService):
