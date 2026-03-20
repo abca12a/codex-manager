@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.database.session import init_database  # noqa: E402
 from src.core.failed_account_retry import (  # noqa: E402
     DEFAULT_FAILED_ACCOUNT_IDS,
     retry_failed_accounts,
@@ -49,6 +50,7 @@ def main() -> int:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = args.output_dir or (ROOT / "run" / f"failed_account_retry_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    init_database()
 
     print(f"输出目录: {output_dir}")
     print(f"目标账号: {', '.join(str(item) for item in args.ids)}")
