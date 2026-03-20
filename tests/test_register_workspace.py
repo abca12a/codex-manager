@@ -2,6 +2,7 @@ import base64
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from src.core.register import (
     CreateAccountResult,
@@ -117,6 +118,7 @@ class RegisterWorkspaceTests(unittest.TestCase):
                 return CreateAccountResult(
                     success=True,
                     continue_url="https://auth.openai.com/direct-continue",
+                    continue_method="POST",
                     response_data={"continue_url": "https://auth.openai.com/direct-continue"},
                 )
 
@@ -126,9 +128,11 @@ class RegisterWorkspaceTests(unittest.TestCase):
             def _select_workspace(self, workspace_id: str):
                 raise AssertionError("workspace select should be skipped")
 
-            def _follow_redirects(self, start_url: str):
+            def _follow_redirects(self, start_url: str, start_method: str = "GET"):
                 if start_url != "https://auth.openai.com/direct-continue":
                     raise AssertionError(f"unexpected continue_url: {start_url}")
+                if start_method != "POST":
+                    raise AssertionError(f"unexpected continue_method: {start_method}")
                 return "http://localhost:1455/auth/callback?code=test&state=state-1"
 
             def _handle_oauth_callback(self, callback_url: str):
@@ -147,6 +151,62 @@ class RegisterWorkspaceTests(unittest.TestCase):
         self.assertEqual(result.account_id, "acct-123")
         self.assertEqual(result.workspace_id, "acct-123")
         self.assertEqual(result.password, "password-1")
+
+    def test_follow_redirects_uses_post_for_first_hop(self):
+        engine = object.__new__(RegistrationEngine)
+        engine.logs = []
+        engine._log = lambda message, level="info": engine.logs.append((level, message))
+
+        post_response = SimpleNamespace(
+            status_code=302,
+            headers={"Location": "http://localhost:1455/auth/callback?code=test&state=abc"},
+            text="",
+        )
+        session = SimpleNamespace(
+            post=Mock(return_value=post_response),
+            get=Mock(),
+        )
+        engine.session = session
+
+        callback_url = RegistrationEngine._follow_redirects(
+            engine,
+            "https://auth.openai.com/add-phone",
+            "POST",
+        )
+
+        self.assertEqual(
+            callback_url,
+            "http://localhost:1455/auth/callback?code=test&state=abc",
+        )
+        session.post.assert_called_once()
+        session.get.assert_not_called()
+
+    def test_extract_next_url_from_html_prefers_callback(self):
+        engine = object.__new__(RegistrationEngine)
+        engine.logs = []
+        engine._log = lambda message, level="info": engine.logs.append((level, message))
+
+        html = '''
+        <html>
+          <body>
+            <a href="/api/oauth/oauth2/auth?client_id=abc">continue</a>
+            <script>
+              window.location="http://localhost:1455/auth/callback?code=test&state=abc";
+            </script>
+          </body>
+        </html>
+        '''
+
+        next_url = RegistrationEngine._extract_next_url_from_html(
+            engine,
+            "https://auth.openai.com/add-phone",
+            html,
+        )
+
+        self.assertEqual(
+            next_url,
+            "http://localhost:1455/auth/callback?code=test&state=abc",
+        )
 
 
 if __name__ == "__main__":

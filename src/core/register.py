@@ -10,6 +10,7 @@ import base64
 import logging
 import secrets
 import string
+import urllib.parse
 from typing import Optional, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -182,6 +183,7 @@ class CreateAccountResult:
     """创建账户结果"""
     success: bool
     continue_url: str = ""
+    continue_method: str = "GET"
     response_data: Dict[str, Any] = None
     error_message: str = ""
 
@@ -585,6 +587,46 @@ class RegistrationEngine:
             self._log(f"验证验证码失败: {e}", "error")
             return False
 
+    def _extract_next_url_from_html(self, current_url: str, html: str) -> Optional[str]:
+        """从 HTML 中提取下一跳 URL。"""
+        try:
+            patterns = [
+                r'https?://[^\s"\'<>]+',
+                r'(?:(?:href|action|content|location(?:\.href)?|replace)\s*[:=]\s*["\'])([^"\']+)',
+            ]
+
+            candidates: list[str] = []
+            seen: set[str] = set()
+            for pattern in patterns:
+                for match in re.finditer(pattern, html, re.IGNORECASE):
+                    value = match.group(1) if match.groups() else match.group(0)
+                    candidate = urllib.parse.urljoin(current_url, value.strip())
+                    if candidate and candidate not in seen:
+                        seen.add(candidate)
+                        candidates.append(candidate)
+
+            for candidate in candidates:
+                if "code=" in candidate and "state=" in candidate:
+                    self._log(f"HTML 中提取到回调 URL: {candidate[:100]}...")
+                    return candidate
+
+            auth_prefixes = (
+                "https://auth.openai.com/api/oauth/oauth2/auth",
+                "https://auth.openai.com/api/accounts/consent",
+                "https://auth.openai.com/oauth/",
+                "https://auth.openai.com/u/",
+            )
+            for candidate in candidates:
+                if candidate.startswith(auth_prefixes):
+                    self._log(f"HTML 中提取到下一跳 URL: {candidate[:100]}...")
+                    return candidate
+
+            return None
+
+        except Exception as e:
+            self._log(f"解析 HTML 下一跳失败: {e}", "warning")
+            return None
+
     def _create_user_account(self) -> CreateAccountResult:
         """创建用户账户"""
         try:
@@ -613,14 +655,20 @@ class RegistrationEngine:
 
             response_json: Dict[str, Any] = {}
             continue_url = ""
+            continue_method = "GET"
             try:
                 response_json = response.json()
                 if isinstance(response_json, dict):
                     top_level_keys = ", ".join(sorted(response_json.keys())[:12]) or "(empty)"
                     self._log(f"create_account 响应字段: {top_level_keys}")
                     continue_url = str(response_json.get("continue_url") or "").strip()
+                    continue_method = str(response_json.get("method") or "GET").strip().upper() or "GET"
                     if continue_url:
                         self._log(f"create_account Continue URL: {continue_url[:100]}...")
+                        self._log(f"create_account Continue Method: {continue_method}")
+                    page_type = str((response_json.get("page") or {}).get("type") or "").strip()
+                    if page_type:
+                        self._log(f"create_account 页面类型: {page_type}")
 
                     candidate_fields: Dict[str, str] = {}
                     for key in (
@@ -654,6 +702,7 @@ class RegistrationEngine:
             return CreateAccountResult(
                 success=True,
                 continue_url=continue_url,
+                continue_method=continue_method,
                 response_data=response_json if isinstance(response_json, dict) else {},
             )
 
@@ -726,34 +775,39 @@ class RegistrationEngine:
             self._log(f"选择 Workspace 失败: {e}", "error")
             return None
 
-    def _follow_redirects(self, start_url: str) -> Optional[str]:
+    def _follow_redirects(self, start_url: str, start_method: str = "GET") -> Optional[str]:
         """跟随重定向链，寻找回调 URL"""
         try:
             current_url = start_url
+            current_method = (start_method or "GET").upper()
             max_redirects = 6
 
             for i in range(max_redirects):
-                self._log(f"重定向 {i+1}/{max_redirects}: {current_url[:100]}...")
+                self._log(f"重定向 {i+1}/{max_redirects}: [{current_method}] {current_url[:100]}...")
 
-                response = self.session.get(
-                    current_url,
-                    allow_redirects=False,
-                    timeout=15
-                )
+                request_fn = self.session.post if current_method == "POST" else self.session.get
+                response = request_fn(current_url, allow_redirects=False, timeout=15)
 
                 location = response.headers.get("Location") or ""
 
                 # 如果不是重定向状态码，停止
                 if response.status_code not in [301, 302, 303, 307, 308]:
                     self._log(f"非重定向状态码: {response.status_code}")
+                    content_type = response.headers.get("Content-Type") or ""
+                    self._log(f"响应 Content-Type: {content_type or '(empty)'}", "warning")
+                    next_url = self._extract_next_url_from_html(current_url, response.text or "")
+                    if next_url:
+                        if "code=" in next_url and "state=" in next_url:
+                            return next_url
+                        current_url = next_url
+                        current_method = "GET"
+                        continue
                     break
 
                 if not location:
                     self._log("重定向响应缺少 Location 头")
                     break
 
-                # 构建下一个 URL
-                import urllib.parse
                 next_url = urllib.parse.urljoin(current_url, location)
 
                 # 检查是否包含回调参数
@@ -762,6 +816,7 @@ class RegistrationEngine:
                     return next_url
 
                 current_url = next_url
+                current_method = "POST" if response.status_code in [307, 308] and current_method == "POST" else "GET"
 
             self._log("未能在重定向链中找到回调 URL", "error")
             return None
@@ -897,6 +952,7 @@ class RegistrationEngine:
                 return result
 
             continue_url = ""
+            continue_method = "GET"
 
             # 12. [已注册账号跳过] 创建用户账户
             if self._is_existing_account:
@@ -908,6 +964,7 @@ class RegistrationEngine:
                     result.error_message = "创建用户账户失败"
                     return result
                 continue_url = create_account_result.continue_url
+                continue_method = create_account_result.continue_method
 
             if continue_url:
                 self._log("13. 使用 create_account 返回的 Continue URL...")
@@ -930,7 +987,7 @@ class RegistrationEngine:
 
             # 15. 跟随重定向链
             self._log("15. 跟随重定向链...")
-            callback_url = self._follow_redirects(continue_url)
+            callback_url = self._follow_redirects(continue_url, continue_method)
             if not callback_url:
                 result.error_message = "跟随重定向链失败"
                 return result
