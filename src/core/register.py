@@ -177,6 +177,15 @@ class SignupFormResult:
     error_message: str = ""
 
 
+@dataclass
+class CreateAccountResult:
+    """创建账户结果"""
+    success: bool
+    continue_url: str = ""
+    response_data: Dict[str, Any] = None
+    error_message: str = ""
+
+
 class RegistrationEngine:
     """
     注册引擎
@@ -576,7 +585,7 @@ class RegistrationEngine:
             self._log(f"验证验证码失败: {e}", "error")
             return False
 
-    def _create_user_account(self) -> bool:
+    def _create_user_account(self) -> CreateAccountResult:
         """创建用户账户"""
         try:
             user_info = generate_random_user_info()
@@ -597,13 +606,21 @@ class RegistrationEngine:
 
             if response.status_code != 200:
                 self._log(f"账户创建失败: {response.text[:200]}", "warning")
-                return False
+                return CreateAccountResult(
+                    success=False,
+                    error_message=f"HTTP {response.status_code}: {response.text[:200]}",
+                )
 
+            response_json: Dict[str, Any] = {}
+            continue_url = ""
             try:
                 response_json = response.json()
                 if isinstance(response_json, dict):
                     top_level_keys = ", ".join(sorted(response_json.keys())[:12]) or "(empty)"
                     self._log(f"create_account 响应字段: {top_level_keys}")
+                    continue_url = str(response_json.get("continue_url") or "").strip()
+                    if continue_url:
+                        self._log(f"create_account Continue URL: {continue_url[:100]}...")
 
                     candidate_fields: Dict[str, str] = {}
                     for key in (
@@ -634,11 +651,15 @@ class RegistrationEngine:
             except Exception as e:
                 self._log(f"create_account 响应解析失败: {e}", "warning")
 
-            return True
+            return CreateAccountResult(
+                success=True,
+                continue_url=continue_url,
+                response_data=response_json if isinstance(response_json, dict) else {},
+            )
 
         except Exception as e:
             self._log(f"创建账户失败: {e}", "error")
-            return False
+            return CreateAccountResult(success=False, error_message=str(e))
 
     def _get_workspace_id(self) -> Optional[str]:
         """获取 Workspace ID"""
@@ -875,30 +896,37 @@ class RegistrationEngine:
                 result.error_message = "验证验证码失败"
                 return result
 
+            continue_url = ""
+
             # 12. [已注册账号跳过] 创建用户账户
             if self._is_existing_account:
                 self._log("12. [已注册账号] 跳过创建用户账户")
             else:
                 self._log("12. 创建用户账户...")
-                if not self._create_user_account():
+                create_account_result = self._create_user_account()
+                if not create_account_result.success:
                     result.error_message = "创建用户账户失败"
                     return result
+                continue_url = create_account_result.continue_url
 
-            # 13. 获取 Workspace ID
-            self._log("13. 获取 Workspace ID...")
-            workspace_id = self._get_workspace_id()
-            if not workspace_id:
-                result.error_message = "获取 Workspace ID 失败"
-                return result
+            if continue_url:
+                self._log("13. 使用 create_account 返回的 Continue URL...")
+            else:
+                # 13. 获取 Workspace ID
+                self._log("13. 获取 Workspace ID...")
+                workspace_id = self._get_workspace_id()
+                if not workspace_id:
+                    result.error_message = "获取 Workspace ID 失败"
+                    return result
 
-            result.workspace_id = workspace_id
+                result.workspace_id = workspace_id
 
-            # 14. 选择 Workspace
-            self._log("14. 选择 Workspace...")
-            continue_url = self._select_workspace(workspace_id)
-            if not continue_url:
-                result.error_message = "选择 Workspace 失败"
-                return result
+                # 14. 选择 Workspace
+                self._log("14. 选择 Workspace...")
+                continue_url = self._select_workspace(workspace_id)
+                if not continue_url:
+                    result.error_message = "选择 Workspace 失败"
+                    return result
 
             # 15. 跟随重定向链
             self._log("15. 跟随重定向链...")
@@ -920,6 +948,10 @@ class RegistrationEngine:
             result.refresh_token = token_info.get("refresh_token", "")
             result.id_token = token_info.get("id_token", "")
             result.password = self.password or ""  # 保存密码（已注册账号为空）
+
+            if not result.workspace_id and result.account_id:
+                result.workspace_id = result.account_id
+                self._log("Workspace ID 缺失，回退使用 Account ID", "warning")
 
             # 设置来源标记
             result.source = "login" if self._is_existing_account else "register"
