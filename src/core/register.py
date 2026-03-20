@@ -6,6 +6,7 @@
 import re
 import json
 import time
+import base64
 import logging
 import secrets
 import string
@@ -34,6 +35,100 @@ from ..config.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_auth_cookie_payload(auth_cookie: str) -> Dict[str, Any]:
+    """解码授权 Cookie 的 JSON 载荷。"""
+    segments = auth_cookie.split(".")
+    if not segments or not segments[0]:
+        raise ValueError("empty auth cookie payload")
+
+    payload = segments[0]
+    pad = "=" * ((4 - (len(payload) % 4)) % 4)
+    decoded = base64.urlsafe_b64decode((payload + pad).encode("ascii"))
+    auth_json = json.loads(decoded.decode("utf-8"))
+    if not isinstance(auth_json, dict):
+        raise ValueError("auth cookie payload is not a JSON object")
+    return auth_json
+
+
+def _extract_workspace_candidates(auth_json: Dict[str, Any]) -> list[Tuple[str, str]]:
+    """从授权 Cookie 载荷里提取所有可能的 workspace/account 标识。"""
+    candidates: list[Tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add_candidate(raw_value: Any, source: str) -> None:
+        if isinstance(raw_value, (dict, list, tuple, set)):
+            return
+        value = str(raw_value or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append((value, source))
+
+    workspaces = auth_json.get("workspaces")
+    if isinstance(workspaces, list):
+        for index, workspace in enumerate(workspaces):
+            if not isinstance(workspace, dict):
+                continue
+            add_candidate(workspace.get("id"), f"workspaces[{index}].id")
+            add_candidate(workspace.get("workspace_id"), f"workspaces[{index}].workspace_id")
+            add_candidate(workspace.get("workspaceId"), f"workspaces[{index}].workspaceId")
+            add_candidate(workspace.get("account_id"), f"workspaces[{index}].account_id")
+
+    direct_keys = (
+        "workspace_id",
+        "workspaceId",
+        "active_workspace_id",
+        "activeWorkspaceId",
+        "default_workspace_id",
+        "defaultWorkspaceId",
+        "account_id",
+        "accountId",
+        "active_account_id",
+        "activeAccountId",
+        "chatgpt_account_id",
+        "chatgptAccountId",
+        "sub",
+    )
+    for key in direct_keys:
+        add_candidate(auth_json.get(key), key)
+
+    container_keys = (
+        "workspace",
+        "active_workspace",
+        "default_workspace",
+        "current_workspace",
+        "account",
+        "active_account",
+        "chatgpt_account",
+        "user",
+    )
+    container_id_keys = (
+        "id",
+        "workspace_id",
+        "workspaceId",
+        "account_id",
+        "accountId",
+        "chatgpt_account_id",
+        "chatgptAccountId",
+    )
+    for container_key in container_keys:
+        container = auth_json.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for id_key in container_id_keys:
+            add_candidate(container.get(id_key), f"{container_key}.{id_key}")
+
+    session_obj = auth_json.get("session")
+    if isinstance(session_obj, dict):
+        for session_key in ("workspace", "account", "user"):
+            nested = session_obj.get(session_key)
+            if not isinstance(nested, dict):
+                continue
+            for id_key in container_id_keys:
+                add_candidate(nested.get(id_key), f"session.{session_key}.{id_key}")
+
+    return candidates
 
 
 @dataclass
@@ -504,6 +599,41 @@ class RegistrationEngine:
                 self._log(f"账户创建失败: {response.text[:200]}", "warning")
                 return False
 
+            try:
+                response_json = response.json()
+                if isinstance(response_json, dict):
+                    top_level_keys = ", ".join(sorted(response_json.keys())[:12]) or "(empty)"
+                    self._log(f"create_account 响应字段: {top_level_keys}")
+
+                    candidate_fields: Dict[str, str] = {}
+                    for key in (
+                        "id",
+                        "account_id",
+                        "accountId",
+                        "workspace_id",
+                        "workspaceId",
+                        "chatgpt_account_id",
+                        "chatgptAccountId",
+                    ):
+                        value = str(response_json.get(key) or "").strip()
+                        if value:
+                            candidate_fields[key] = value
+
+                    account_obj = response_json.get("account")
+                    if isinstance(account_obj, dict):
+                        for key in ("id", "account_id", "workspace_id"):
+                            value = str(account_obj.get(key) or "").strip()
+                            if value:
+                                candidate_fields[f"account.{key}"] = value
+
+                    if candidate_fields:
+                        self._log(
+                            "create_account 候选 ID: "
+                            + json.dumps(candidate_fields, ensure_ascii=False, sort_keys=True)
+                        )
+            except Exception as e:
+                self._log(f"create_account 响应解析失败: {e}", "warning")
+
             return True
 
         except Exception as e:
@@ -518,31 +648,20 @@ class RegistrationEngine:
                 self._log("未能获取到授权 Cookie", "error")
                 return None
 
-            # 解码 JWT
-            import base64
-            import json as json_module
-
             try:
-                segments = auth_cookie.split(".")
-                if len(segments) < 1:
-                    self._log("授权 Cookie 格式错误", "error")
+                auth_json = _decode_auth_cookie_payload(auth_cookie)
+                candidates = _extract_workspace_candidates(auth_json)
+                if not candidates:
+                    top_level_keys = ", ".join(sorted(auth_json.keys())[:20]) or "(empty)"
+                    self._log(f"授权 Cookie 顶层字段: {top_level_keys}", "warning")
+                    self._log("授权 Cookie 里没有可用 workspace 信息", "error")
                     return None
 
-                # 解码第一个 segment
-                payload = segments[0]
-                pad = "=" * ((4 - (len(payload) % 4)) % 4)
-                decoded = base64.urlsafe_b64decode((payload + pad).encode("ascii"))
-                auth_json = json_module.loads(decoded.decode("utf-8"))
-
-                workspaces = auth_json.get("workspaces") or []
-                if not workspaces:
-                    self._log("授权 Cookie 里没有 workspace 信息", "error")
-                    return None
-
-                workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
-                if not workspace_id:
-                    self._log("无法解析 workspace_id", "error")
-                    return None
+                workspace_id, source = candidates[0]
+                if source != "workspaces[0].id":
+                    sources_preview = ", ".join(source_name for _, source_name in candidates[:6])
+                    self._log(f"Workspace ID 回退来源: {source}", "warning")
+                    self._log(f"授权 Cookie 候选来源: {sources_preview}", "warning")
 
                 self._log(f"Workspace ID: {workspace_id}")
                 return workspace_id
