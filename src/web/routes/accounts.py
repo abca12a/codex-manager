@@ -158,6 +158,7 @@ class AccountResponse(BaseModel):
     cpa_uploaded_at: Optional[str] = None
     newapi_uploaded: bool = False
     newapi_uploaded_at: Optional[str] = None
+    manual_mark: Optional[str] = None
     cookies: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -222,6 +223,7 @@ def resolve_account_ids(
 
 def account_to_response(account: Account) -> AccountResponse:
     """转换 Account 模型为响应模型"""
+    extra_data = _get_account_extra_data(account)
     return AccountResponse(
         id=account.id,
         email=account.email,
@@ -239,6 +241,7 @@ def account_to_response(account: Account) -> AccountResponse:
         cpa_uploaded_at=account.cpa_uploaded_at.isoformat() if account.cpa_uploaded_at else None,
         newapi_uploaded=account.newapi_uploaded or False,
         newapi_uploaded_at=account.newapi_uploaded_at.isoformat() if account.newapi_uploaded_at else None,
+        manual_mark=str(extra_data.get("manual_mark") or "").strip() or None,
         cookies=account.cookies,
         created_at=account.created_at.isoformat() if account.created_at else None,
         updated_at=account.updated_at.isoformat() if account.updated_at else None,

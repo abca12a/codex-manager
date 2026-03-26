@@ -16,6 +16,7 @@ from src.core.register import (
     _extract_workspace_candidates,
 )
 from src.services.temp_mail import TempMailService
+from src.web.routes.accounts import account_to_response
 
 
 def _make_auth_cookie(payload: dict) -> str:
@@ -26,6 +27,23 @@ def _make_auth_cookie(payload: dict) -> str:
 
 
 class RegisterWorkspaceTests(unittest.TestCase):
+    def test_account_to_response_exposes_manual_mark_from_extra_data(self):
+        manager = DatabaseSessionManager("sqlite:///:memory:")
+        manager.create_tables()
+
+        with manager.session_scope() as db:
+            account = crud.create_account(
+                db,
+                email="manual-mark@example.com",
+                email_service="temp_mail",
+                status="failed",
+                extra_data={"manual_mark": "x"},
+            )
+
+            response = account_to_response(account)
+
+        self.assertEqual(response.manual_mark, "x")
+
     def test_decode_auth_cookie_payload(self):
         payload = {"workspaces": [{"id": "ws-123"}]}
 

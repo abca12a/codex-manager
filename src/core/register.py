@@ -327,7 +327,8 @@ class RegistrationEngine:
 
     def _emit_status(self, phase: str, detail: str, **extra):
         """向外部上报阶段进度。"""
-        if not self.status_callback:
+        status_callback = getattr(self, "status_callback", None)
+        if not status_callback:
             return
 
         payload = {
@@ -339,7 +340,7 @@ class RegistrationEngine:
         payload.update({key: value for key, value in extra.items() if value is not None})
 
         try:
-            self.status_callback(payload)
+            status_callback(payload)
         except Exception as e:
             logger.warning(f"上报任务阶段状态失败: {e}")
 
@@ -479,11 +480,13 @@ class RegistrationEngine:
     def _reset_flow_state(self, keep_identity: bool = False) -> None:
         """重置单次流程状态，支持同一个引擎实例重复运行。"""
         self.logs = []
+        self.phase_history = []
         self._otp_sent_at = None
         self._is_existing_account = False
         self.session = None
         self.session_token = None
         self.oauth_start = None
+        self.device_id = None
         if not keep_identity:
             self.email = None
             self.password = None
@@ -2003,16 +2006,13 @@ class RegistrationEngine:
             # 10. 获取验证码
             self._log("10. 等待验证码...")
             self._emit_status("otp_secondary", "等待验证码邮件", step_index=10)
-            otp_phase_started_at = time.time()
-            code, otp_phase = self._phase_otp_secondary(
-                PhaseContext(otp_sent_at=self._otp_sent_at),
-                started_at=otp_phase_started_at,
-            )
+            code = self._get_verification_code()
+            otp_phase = self._get_phase_result(PHASE_OTP_SECONDARY)
             if not code:
                 result.error_message = (
-                    otp_phase.error_message if otp_phase.error_message else "获取验证码失败"
+                    otp_phase.error_message if otp_phase and otp_phase.error_message else "获取验证码失败"
                 )
-                result.error_code = otp_phase.error_code
+                result.error_code = otp_phase.error_code if otp_phase else ""
                 return result
 
             # 11. 验证验证码
@@ -2043,6 +2043,12 @@ class RegistrationEngine:
 
             if continue_url:
                 self._log(f"{next_step}. 使用 create_account 返回的 Continue URL...")
+                self._emit_status("redirect_chain", "跟随 create_account 返回的 Continue URL", step_index=next_step)
+                callback_url = self._follow_redirects(continue_url, continue_method)
+                if not callback_url:
+                    result.error_message = "跟随重定向链失败"
+                    return result
+                next_step += 1
             elif not self._is_existing_account:
                 self._log(f"{next_step}. [新账号] 推进 Codex 授权流程...")
                 self._emit_status("oauth_reentry", "推进 Codex 授权流程", step_index=next_step)
@@ -2051,7 +2057,7 @@ class RegistrationEngine:
                     result.workspace_id = workspace_id
                     next_step += 1
 
-            if not result.workspace_id:
+            if not callback_url and not result.workspace_id:
                 # 获取 Workspace ID
                 self._log(f"{next_step}. 获取 Workspace ID...")
                 self._emit_status("workspace_extract", "从授权态提取 Workspace ID", step_index=next_step)
