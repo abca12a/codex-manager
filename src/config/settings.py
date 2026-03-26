@@ -76,7 +76,7 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     ),
     "webui_port": SettingDefinition(
         db_key="webui.port",
-        default_value=8000,
+        default_value=15555,
         category=SettingCategory.WEBUI,
         description="Web UI 监听端口"
     ),
@@ -609,7 +609,7 @@ class Settings(BaseModel):
 
     # Web UI 配置
     webui_host: str = "0.0.0.0"
-    webui_port: int = 8000
+    webui_port: int = 15555
     webui_secret_key: SecretStr = SecretStr("your-secret-key-change-in-production")
     webui_access_password: SecretStr = SecretStr("admin123")
 

@@ -11,6 +11,8 @@ let selectedAccounts = new Set();
 let isLoading = false;
 let selectAllPages = false;  // 是否选中了全部页
 let currentFilters = { status: '', email_service: '', search: '' };  // 当前筛选条件
+const refreshingAccountIds = new Set();
+let isBatchValidating = false;
 
 // DOM 元素
 const elements = {
@@ -105,9 +107,28 @@ function initEventListeners() {
     document.getElementById('batch-upload-cpa-item').addEventListener('click', (e) => { e.preventDefault(); uploadMenu.classList.remove('active'); handleBatchUploadCpa(); });
     document.getElementById('batch-upload-sub2api-item').addEventListener('click', (e) => { e.preventDefault(); uploadMenu.classList.remove('active'); handleBatchUploadSub2Api(); });
     document.getElementById('batch-upload-tm-item').addEventListener('click', (e) => { e.preventDefault(); uploadMenu.classList.remove('active'); handleBatchUploadTm(); });
+    document.getElementById('batch-upload-newapi-item').addEventListener('click', (e) => { e.preventDefault(); uploadMenu.classList.remove('active'); handleBatchUploadNewapi(); });
 
     // 批量删除
     elements.batchDeleteBtn.addEventListener('click', handleBatchDelete);
+
+    // Codex Auth 登录
+    const codexAuthBtn = document.getElementById('codex-auth-login-btn');
+    if (codexAuthBtn) {
+        codexAuthBtn.addEventListener('click', handleCodexAuthLogin);
+    }
+    const closeCodexAuthModal = document.getElementById('close-codex-auth-modal');
+    if (closeCodexAuthModal) {
+        closeCodexAuthModal.addEventListener('click', () => {
+            document.getElementById('codex-auth-modal').classList.remove('active');
+        });
+    }
+    const closeCodexAuthModalBtn = document.getElementById('close-codex-auth-modal-btn');
+    if (closeCodexAuthModalBtn) {
+        closeCodexAuthModalBtn.addEventListener('click', () => {
+            document.getElementById('codex-auth-modal').classList.remove('active');
+        });
+    }
 
     // 全选（当前页）
     elements.selectAll.addEventListener('change', (e) => {
@@ -314,6 +335,13 @@ function renderAccounts(accounts) {
             </td>
             <td>
                 <div class="cpa-status">
+                    ${account.newapi_uploaded
+                        ? `<span class="badge uploaded" title="已上传于 ${format.date(account.newapi_uploaded_at)}">✓</span>`
+                        : `<span class="badge pending">-</span>`}
+                </div>
+            </td>
+            <td>
+                <div class="cpa-status">
                     ${account.subscription_type
                         ? `<span class="badge uploaded" title="${account.subscription_type}">${account.subscription_type}</span>`
                         : `<span class="badge pending">-</span>`}
@@ -479,7 +507,10 @@ function updateBatchButtons() {
     elements.batchCheckSubBtn.disabled = count === 0;
     elements.exportBtn.disabled = count === 0;
 
-    elements.batchDeleteBtn.textContent = count > 0 ? `🗑️ 删除 (${count})` : '🗑️ 批量删除';
+    const codexAuthBtn = document.getElementById('codex-auth-login-btn');
+    if (codexAuthBtn) codexAuthBtn.disabled = count === 0;
+
+    elements.batchDeleteBtn.textContent = count > 0 ? `删除 (${count})` : '删除';
     elements.batchRefreshBtn.textContent = count > 0 ? `🔄 刷新 (${count})` : '🔄 刷新Token';
     elements.batchValidateBtn.textContent = count > 0 ? `✅ 验证 (${count})` : '✅ 验证Token';
     elements.batchUploadBtn.textContent = count > 0 ? `☁️ 上传 (${count})` : '☁️ 上传';
@@ -488,6 +519,12 @@ function updateBatchButtons() {
 
 // 刷新单个账号Token
 async function refreshToken(id) {
+    if (refreshingAccountIds.has(id)) {
+        toast.info('该账号正在刷新，请稍候...');
+        return;
+    }
+    refreshingAccountIds.add(id);
+
     try {
         toast.info('正在刷新Token...');
         const result = await api.post(`/accounts/${id}/refresh`);
@@ -500,6 +537,8 @@ async function refreshToken(id) {
         }
     } catch (error) {
         toast.error('刷新失败: ' + error.message);
+    } finally {
+        refreshingAccountIds.delete(id);
     }
 }
 
@@ -528,17 +567,24 @@ async function handleBatchRefresh() {
 // 批量验证Token
 async function handleBatchValidate() {
     if (getEffectiveCount() === 0) return;
+    if (isBatchValidating) {
+        toast.info('批量验证进行中，请稍候...');
+        return;
+    }
+
+    isBatchValidating = true;
 
     elements.batchValidateBtn.disabled = true;
     elements.batchValidateBtn.textContent = '验证中...';
 
     try {
-        const result = await api.post('/accounts/batch-validate', buildBatchPayload());
+        const result = await api.post('/accounts/batch-validate', buildBatchPayload(), { timeoutMs: 120000 });
         toast.info(`有效: ${result.valid_count}，无效: ${result.invalid_count}`);
         loadAccounts();
     } catch (error) {
         toast.error('批量验证失败: ' + error.message);
     } finally {
+        isBatchValidating = false;
         updateBatchButtons();
     }
 }
@@ -707,7 +753,14 @@ async function exportAccounts(format) {
         });
 
         if (!response.ok) {
-            throw new Error(`导出失败: HTTP ${response.status}`);
+            let errorMessage = `HTTP ${response.status}`;
+            try {
+                const errorData = await response.json();
+                errorMessage = errorData.detail || errorData.message || errorMessage;
+            } catch (parseError) {
+                // ignore non-JSON error bodies and fall back to status text
+            }
+            throw new Error(errorMessage);
         }
 
         // 获取文件内容
@@ -715,7 +768,7 @@ async function exportAccounts(format) {
 
         // 从 Content-Disposition 获取文件名
         const disposition = response.headers.get('Content-Disposition');
-        let filename = `accounts_${Date.now()}.${(format === 'cpa' || format === 'sub2api') ? 'json' : format}`;
+        let filename = `accounts_${Date.now()}.${(format === 'cpa' || format === 'sub2api' || format === 'codex_auth') ? 'json' : format}`;
         if (disposition) {
             const match = disposition.match(/filename=(.+)/);
             if (match) {
@@ -824,6 +877,7 @@ async function uploadAccount(id) {
         { label: '☁️ 上传到 CPA', value: 'cpa' },
         { label: '🔗 上传到 Sub2API', value: 'sub2api' },
         { label: '🚀 上传到 Team Manager', value: 'tm' },
+        { label: '🧩 上传到 NEWAPI', value: 'newapi' },
     ];
 
     const choice = await new Promise((resolve) => {
@@ -853,6 +907,7 @@ async function uploadAccount(id) {
     if (choice === 'cpa') return uploadToCpa(id);
     if (choice === 'sub2api') return uploadToSub2Api(id);
     if (choice === 'tm') return uploadToTm(id);
+    if (choice === 'newapi') return uploadToNewapi(id);
 }
 
 // 上传单个账号到CPA
@@ -1192,6 +1247,120 @@ async function handleBatchUploadTm() {
     }
 }
 
+// ============== NEWAPI 上传 ==============
+
+function selectNewapiService() {
+    return new Promise(async (resolve) => {
+        const modal = document.getElementById('newapi-service-modal');
+        const listEl = document.getElementById('newapi-service-list');
+        const closeBtn = document.getElementById('close-newapi-modal');
+        const cancelBtn = document.getElementById('cancel-newapi-modal-btn');
+        const autoBtn = document.getElementById('newapi-use-auto-btn');
+
+        listEl.innerHTML = '<div style="text-align:center;color:var(--text-muted)">加载中...</div>';
+        modal.classList.add('active');
+
+        let services = [];
+        try {
+            services = await api.get('/newapi-services?enabled=true');
+        } catch (e) {
+            services = [];
+        }
+
+        if (services.length === 0) {
+            listEl.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:12px;">暂无已启用的 NEWAPI 服务，将自动选择第一个</div>';
+        } else {
+            listEl.innerHTML = services.map(s => `
+                <div class="newapi-service-item" data-id="${s.id}" style="
+                    padding: 10px 14px;
+                    border: 1px solid var(--border);
+                    border-radius: 8px;
+                    cursor: pointer;
+                    transition: background 0.15s;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                ">
+                    <div>
+                        <div style="font-weight:500;">${escapeHtml(s.name)}</div>
+                        <div style="font-size:0.8rem;color:var(--text-muted);">${escapeHtml(s.api_url)}</div>
+                    </div>
+                    <span class="badge" style="background:var(--primary);color:#fff;font-size:0.7rem;padding:2px 8px;border-radius:10px;">选择</span>
+                </div>
+            `).join('');
+
+            listEl.querySelectorAll('.newapi-service-item').forEach(item => {
+                item.addEventListener('mouseenter', () => item.style.background = 'var(--surface-hover)');
+                item.addEventListener('mouseleave', () => item.style.background = '');
+                item.addEventListener('click', () => {
+                    cleanup();
+                    resolve({ service_id: parseInt(item.dataset.id) });
+                });
+            });
+        }
+
+        function cleanup() {
+            modal.classList.remove('active');
+            closeBtn.removeEventListener('click', onCancel);
+            cancelBtn.removeEventListener('click', onCancel);
+            autoBtn.removeEventListener('click', onAuto);
+        }
+        function onCancel() { cleanup(); resolve(null); }
+        function onAuto() { cleanup(); resolve({ service_id: null }); }
+
+        closeBtn.addEventListener('click', onCancel);
+        cancelBtn.addEventListener('click', onCancel);
+        autoBtn.addEventListener('click', onAuto);
+    });
+}
+
+async function uploadToNewapi(id) {
+    const choice = await selectNewapiService();
+    if (choice === null) return;
+    try {
+        toast.info('正在上传到 NEWAPI...');
+        const payload = {};
+        if (choice.service_id != null) payload.service_id = choice.service_id;
+        const result = await api.post(`/accounts/${id}/upload-newapi`, payload);
+        if (result.success) {
+            toast.success('上传成功');
+        } else {
+            toast.error('上传失败: ' + (result.message || '未知错误'));
+        }
+    } catch (e) {
+        toast.error('上传失败: ' + e.message);
+    }
+}
+
+async function handleBatchUploadNewapi() {
+    const count = getEffectiveCount();
+    if (count === 0) return;
+
+    const choice = await selectNewapiService();
+    if (choice === null) return;
+
+    const confirmed = await confirm(`确定要将选中的 ${count} 个账号上传到 NEWAPI 吗？`);
+    if (!confirmed) return;
+
+    elements.batchUploadBtn.disabled = true;
+    elements.batchUploadBtn.textContent = '上传中...';
+
+    try {
+        const payload = buildBatchPayload();
+        if (choice.service_id != null) payload.service_id = choice.service_id;
+        const result = await api.post('/accounts/batch-upload-newapi', payload);
+        let message = `成功: ${result.success_count}`;
+        if (result.failed_count > 0) message += `, 失败: ${result.failed_count}`;
+        if (result.skipped_count > 0) message += `, 跳过: ${result.skipped_count}`;
+        toast.success(message);
+        loadAccounts();
+    } catch (e) {
+        toast.error('批量上传失败: ' + e.message);
+    } finally {
+        updateBatchButtons();
+    }
+}
+
 // 更多菜单切换
 function toggleMoreMenu(btn) {
     const menu = btn.nextElementSibling;
@@ -1248,4 +1417,189 @@ function showInboxCodeResult(code, email) {
         </div>
     `;
     elements.detailModal.classList.add('active');
+}
+
+// ============== Codex Auth 登录 ==============
+
+let codexAuthResults = [];
+
+async function handleCodexAuthLogin() {
+    const count = getEffectiveCount();
+    if (count === 0) {
+        toast.warning('请先选择要登录的账号');
+        return;
+    }
+
+    const confirmed = await confirm(`将对选中的 ${count} 个账号执行 Codex Auth 登录（需要接收邮箱验证码），确定继续吗？`);
+    if (!confirmed) return;
+
+    const modal = document.getElementById('codex-auth-modal');
+    const logsEl = document.getElementById('codex-auth-logs');
+    const statusEl = document.getElementById('codex-auth-status');
+    const downloadBtn = document.getElementById('codex-auth-download-btn');
+
+    logsEl.textContent = '';
+    statusEl.textContent = '正在启动 Codex Auth 登录...';
+    downloadBtn.style.display = 'none';
+    codexAuthResults = [];
+    modal.classList.add('active');
+
+    if (count === 1 && !selectAllPages) {
+        // 单账号登录
+        const accountId = [...selectedAccounts][0];
+        await codexAuthLoginSingle(accountId, logsEl, statusEl, downloadBtn);
+    } else {
+        // 批量登录
+        await codexAuthLoginBatch(logsEl, statusEl, downloadBtn);
+    }
+}
+
+async function codexAuthLoginSingle(accountId, logsEl, statusEl, downloadBtn) {
+    try {
+        const response = await fetch('/api/accounts/codex-auth-login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ account_id: accountId }),
+        });
+
+        if (!response.ok) {
+            const err = await response.json();
+            statusEl.textContent = '登录失败: ' + (err.detail || response.statusText);
+            return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'log') {
+                        logsEl.textContent += data.message + '\n';
+                        logsEl.scrollTop = logsEl.scrollHeight;
+                    } else if (data.type === 'result') {
+                        if (data.success && data.auth_json) {
+                            statusEl.textContent = 'Codex Auth 登录成功!';
+                            codexAuthResults = [{ email: data.email, auth_json: data.auth_json }];
+                            downloadBtn.style.display = 'inline-block';
+                            downloadBtn.onclick = () => downloadCodexAuthResults();
+                            loadAccounts();
+                        } else {
+                            statusEl.textContent = '登录失败: ' + (data.error_message || '未知错误');
+                        }
+                    }
+                } catch (e) { /* ignore parse errors */ }
+            }
+        }
+    } catch (error) {
+        statusEl.textContent = '登录失败: ' + error.message;
+    }
+}
+
+async function codexAuthLoginBatch(logsEl, statusEl, downloadBtn) {
+    try {
+        const payload = buildBatchPayload();
+        const response = await fetch('/api/accounts/codex-auth-login/batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+            const err = await response.json();
+            statusEl.textContent = '批量登录失败: ' + (err.detail || response.statusText);
+            return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let successCount = 0;
+        let failCount = 0;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'log') {
+                        logsEl.textContent += data.message + '\n';
+                        logsEl.scrollTop = logsEl.scrollHeight;
+                    } else if (data.type === 'progress') {
+                        statusEl.textContent = `正在处理 ${data.current}/${data.total}: ${data.email}`;
+                    } else if (data.type === 'account_result') {
+                        if (data.success) {
+                            successCount++;
+                            logsEl.textContent += `[${data.email}] 登录成功\n`;
+                        } else {
+                            failCount++;
+                            logsEl.textContent += `[${data.email}] 登录失败: ${data.error || '未知错误'}\n`;
+                        }
+                        logsEl.scrollTop = logsEl.scrollHeight;
+                    } else if (data.type === 'batch_done') {
+                        codexAuthResults = data.results || [];
+                        statusEl.textContent = `批量登录完成: 成功 ${successCount}, 失败 ${failCount}`;
+                        if (codexAuthResults.length > 0) {
+                            downloadBtn.style.display = 'inline-block';
+                            downloadBtn.onclick = () => downloadCodexAuthResults();
+                        }
+                        loadAccounts();
+                    }
+                } catch (e) { /* ignore parse errors */ }
+            }
+        }
+    } catch (error) {
+        statusEl.textContent = '批量登录失败: ' + error.message;
+    }
+}
+
+function downloadCodexAuthResults() {
+    if (codexAuthResults.length === 0) return;
+
+    if (codexAuthResults.length === 1) {
+        // 单个直接下载 auth.json
+        const item = codexAuthResults[0];
+        const blob = new Blob([JSON.stringify(item.auth_json, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'auth.json';
+        document.body.appendChild(a);
+        a.click();
+        URL.revokeObjectURL(url);
+        a.remove();
+    } else {
+        // 多个：逐个下载（浏览器端无法打 ZIP，逐个下载）
+        codexAuthResults.forEach((item, i) => {
+            setTimeout(() => {
+                const blob = new Blob([JSON.stringify(item.auth_json, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${item.email}_auth.json`;
+                document.body.appendChild(a);
+                a.click();
+                URL.revokeObjectURL(url);
+                a.remove();
+            }, i * 300);
+        });
+    }
+    toast.success(`已下载 ${codexAuthResults.length} 个 auth.json`);
 }

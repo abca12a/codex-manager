@@ -94,6 +94,9 @@ const elements = {
     autoUploadTm: document.getElementById('auto-upload-tm'),
     tmServiceSelectGroup: document.getElementById('tm-service-select-group'),
     tmServiceSelect: document.getElementById('tm-service-select'),
+    autoUploadNewapi: document.getElementById('auto-upload-newapi'),
+    newapiServiceSelectGroup: document.getElementById('newapi-service-select-group'),
+    newapiServiceSelect: document.getElementById('newapi-service-select'),
 };
 
 // 初始化
@@ -113,6 +116,7 @@ async function initAutoUploadOptions() {
         loadServiceSelect('/cpa-services?enabled=true', elements.cpaServiceSelect, elements.autoUploadCpa, elements.cpaServiceSelectGroup),
         loadServiceSelect('/sub2api-services?enabled=true', elements.sub2apiServiceSelect, elements.autoUploadSub2api, elements.sub2apiServiceSelectGroup),
         loadServiceSelect('/tm-services?enabled=true', elements.tmServiceSelect, elements.autoUploadTm, elements.tmServiceSelectGroup),
+        loadServiceSelect('/newapi-services?enabled=true', elements.newapiServiceSelect, elements.autoUploadNewapi, elements.newapiServiceSelectGroup),
     ]);
 }
 
@@ -480,6 +484,8 @@ async function handleStartRegistration(e) {
         sub2api_service_ids: elements.autoUploadSub2api && elements.autoUploadSub2api.checked ? getSelectedServiceIds(elements.sub2apiServiceSelect) : [],
         auto_upload_tm: elements.autoUploadTm ? elements.autoUploadTm.checked : false,
         tm_service_ids: elements.autoUploadTm && elements.autoUploadTm.checked ? getSelectedServiceIds(elements.tmServiceSelect) : [],
+        auto_upload_newapi: elements.autoUploadNewapi ? elements.autoUploadNewapi.checked : false,
+        newapi_service_ids: elements.autoUploadNewapi && elements.autoUploadNewapi.checked ? getSelectedServiceIds(elements.newapiServiceSelect) : [],
     };
 
     // 如果选择了数据库中的服务，传递 service_id
@@ -552,6 +558,12 @@ function connectWebSocket(taskUuid) {
                 const logType = getLogType(data.message);
                 addLog(logType, data.message);
             } else if (data.type === 'status') {
+                if (data.email) {
+                    elements.taskEmail.textContent = data.email;
+                }
+                if (data.email_service) {
+                    elements.taskService.textContent = getServiceTypeText(data.email_service);
+                }
                 updateTaskStatus(data.status);
 
                 // 检查是否完成
@@ -1190,6 +1202,8 @@ async function handleOutlookBatchRegistration() {
         sub2api_service_ids: elements.autoUploadSub2api && elements.autoUploadSub2api.checked ? getSelectedServiceIds(elements.sub2apiServiceSelect) : [],
         auto_upload_tm: elements.autoUploadTm ? elements.autoUploadTm.checked : false,
         tm_service_ids: elements.autoUploadTm && elements.autoUploadTm.checked ? getSelectedServiceIds(elements.tmServiceSelect) : [],
+        auto_upload_newapi: elements.autoUploadNewapi ? elements.autoUploadNewapi.checked : false,
+        newapi_service_ids: elements.autoUploadNewapi && elements.autoUploadNewapi.checked ? getSelectedServiceIds(elements.newapiServiceSelect) : [],
     };
 
     addLog('info', `[系统] 正在启动 Outlook 批量注册 (${selectedIds.length} 个账户)...`);
@@ -1275,12 +1289,13 @@ function connectBatchWebSocket(batchId) {
                     if (!toastShown) {
                         toastShown = true;
                         if (data.status === 'completed') {
-                            addLog('success', `[完成] Outlook 批量任务完成！成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`);
+                            const batchLabel = isOutlookBatchMode ? 'Outlook 批量' : '批量';
+                            addLog('success', `[完成] ${batchLabel}任务完成！成功: ${data.success}, 失败: ${data.failed}, 跳过: ${data.skipped || 0}`);
                             if (data.success > 0) {
-                                toast.success(`Outlook 批量注册完成，成功 ${data.success} 个`);
+                                toast.success(`${batchLabel}注册完成，成功 ${data.success} 个`);
                                 loadRecentAccounts();
                             } else {
-                                toast.warning('Outlook 批量注册完成，但没有成功注册任何账号');
+                                toast.warning(`${batchLabel}注册完成，但没有成功注册任何账号`);
                             }
                         } else if (data.status === 'failed') {
                             addLog('error', '[错误] 批量任务执行失败');
@@ -1306,7 +1321,7 @@ function connectBatchWebSocket(batchId) {
 
             if (shouldPoll && currentBatch) {
                 console.log('切换到轮询模式');
-                startOutlookBatchPolling(currentBatch.batch_id);
+                startCurrentBatchPolling(currentBatch.batch_id);
             }
         };
 
@@ -1314,12 +1329,12 @@ function connectBatchWebSocket(batchId) {
             console.error('批量任务 WebSocket 错误:', error);
             stopBatchWebSocketHeartbeat();
             // 切换到轮询
-            startOutlookBatchPolling(batchId);
+            startCurrentBatchPolling(batchId);
         };
 
     } catch (error) {
         console.error('批量任务 WebSocket 连接失败:', error);
-        startOutlookBatchPolling(batchId);
+        startCurrentBatchPolling(batchId);
     }
 }
 
@@ -1330,6 +1345,15 @@ function disconnectBatchWebSocket() {
         batchWebSocket.close();
         batchWebSocket = null;
     }
+}
+
+function startCurrentBatchPolling(batchId) {
+    if (isOutlookBatchMode) {
+        startOutlookBatchPolling(batchId);
+        return;
+    }
+
+    startBatchPolling(batchId);
 }
 
 // 开始批量任务心跳

@@ -39,6 +39,8 @@ class Account(Base):
     refresh_token = Column(Text)
     id_token = Column(Text)
     session_token = Column(Text)  # 会话令牌（优先刷新方式）
+    token_sync_status = Column(String(20), default='not_ready')  # 'not_ready', 'pending', 'synced'
+    token_sync_updated_at = Column(DateTime, default=datetime.utcnow)
     client_id = Column(String(255))  # OAuth Client ID
     account_id = Column(String(255))
     workspace_id = Column(String(255))
@@ -52,6 +54,8 @@ class Account(Base):
     extra_data = Column(JSONEncodedDict)  # 额外信息存储
     cpa_uploaded = Column(Boolean, default=False)  # 是否已上传到 CPA
     cpa_uploaded_at = Column(DateTime)  # 上传时间
+    newapi_uploaded = Column(Boolean, default=False)
+    newapi_uploaded_at = Column(DateTime)
     source = Column(String(20), default='register')  # 'register' 或 'login'，区分账号来源
     subscription_type = Column(String(20))  # None / 'plus' / 'team'
     subscription_at = Column(DateTime)  # 订阅开通时间
@@ -76,11 +80,15 @@ class Account(Base):
             'proxy_used': self.proxy_used,
             'cpa_uploaded': self.cpa_uploaded,
             'cpa_uploaded_at': self.cpa_uploaded_at.isoformat() if self.cpa_uploaded_at else None,
+            'newapi_uploaded': self.newapi_uploaded,
+            'newapi_uploaded_at': self.newapi_uploaded_at.isoformat() if self.newapi_uploaded_at else None,
             'source': self.source,
             'subscription_type': self.subscription_type,
             'subscription_at': self.subscription_at.isoformat() if self.subscription_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'token_sync_status': self.token_sync_status,
+            'token_sync_updated_at': self.token_sync_updated_at.isoformat() if self.token_sync_updated_at else None,
         }
 
 
@@ -169,6 +177,23 @@ class TeamManagerService(Base):
     api_key = Column(Text, nullable=False)  # X-API-Key
     enabled = Column(Boolean, default=True)
     priority = Column(Integer, default=0)  # 优先级
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class NewapiService(Base):
+    """NEWAPI（如 New API）服务配置表"""
+    __tablename__ = 'newapi_services'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    api_url = Column(String(500), nullable=False)
+    api_key = Column(Text, nullable=False)
+    channel_type = Column(Integer, default=57)
+    channel_base_url = Column(String(500), default="")
+    channel_models = Column(Text, default="gpt-5.4,gpt-5,gpt-5-codex,gpt-5-codex-mini,gpt-5.1,gpt-5.1-codex,gpt-5.1-codex-max,gpt-5.1-codex-mini,gpt-5.2,gpt-5.2-codex,gpt-5.3-codex,gpt-5-openai-compact,gpt-5-codex-openai-compact,gpt-5-codex-mini-openai-compact,gpt-5.1-openai-compact,gpt-5.1-codex-openai-compact,gpt-5.1-codex-max-openai-compact,gpt-5.1-codex-mini-openai-compact,gpt-5.2-openai-compact,gpt-5.2-codex-openai-compact,gpt-5.3-codex-openai-compact")
+    enabled = Column(Boolean, default=True)
+    priority = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

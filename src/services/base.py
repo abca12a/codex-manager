@@ -5,18 +5,118 @@
 
 import abc
 import logging
+import re
+import time
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 from enum import Enum
 
-from ..config.constants import EmailServiceType
+from ..config.constants import EmailServiceType, OTP_CODE_PATTERN, OTP_CODE_SEMANTIC_PATTERN
 
 
 logger = logging.getLogger(__name__)
+
+EMAIL_PROVIDER_BACKOFF_BASE_SECONDS = 30
+EMAIL_PROVIDER_BACKOFF_MAX_SECONDS = 3600
+OTP_TIMEOUT_ERROR_PREFIX = "OTP_TIMEOUT"
+
+
+@dataclass(frozen=True)
+class EmailProviderBackoffState:
+    """邮箱供应商退避状态"""
+
+    failures: int = 0
+    delay_seconds: int = 0
+    opened_until: float = 0.0
+    retry_after: Optional[int] = None
+    last_error: Optional[str] = None
+
+    def is_open(self, now: Optional[float] = None) -> bool:
+        now_ts = now if now is not None else time.time()
+        return self.opened_until > now_ts
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "failures": self.failures,
+            "delay_seconds": self.delay_seconds,
+            "opened_until": self.opened_until,
+            "retry_after": self.retry_after,
+            "last_error": self.last_error,
+        }
+
+
+def calculate_adaptive_backoff_delay(
+    failures: int,
+    base_delay: int = EMAIL_PROVIDER_BACKOFF_BASE_SECONDS,
+    max_delay: int = EMAIL_PROVIDER_BACKOFF_MAX_SECONDS,
+    is_timeout: bool = False,
+) -> int:
+    """根据连续失败次数计算指数退避时长"""
+    normalized_failures = max(0, failures)
+    if is_timeout and normalized_failures >= 3:
+        return max_delay
+    exponent = max(0, normalized_failures - 1)
+    return min(base_delay * (2 ** exponent), max_delay)
+
+
+def is_otp_timeout_error(error: object) -> bool:
+    """识别 OTP 超时类错误码。"""
+    if error is None:
+        return False
+    if isinstance(error, OTPTimeoutEmailServiceError):
+        return True
+    error_code = getattr(error, "error_code", "")
+    if isinstance(error_code, str) and error_code.startswith(OTP_TIMEOUT_ERROR_PREFIX):
+        return True
+    return False
+
+
+def apply_adaptive_backoff(
+    current_state: Optional[EmailProviderBackoffState],
+    error: "EmailServiceError",
+    now: Optional[float] = None,
+) -> EmailProviderBackoffState:
+    """在限流场景下推进邮箱供应商退避状态"""
+    state = current_state or EmailProviderBackoffState()
+    now_ts = now if now is not None else time.time()
+    next_failures = state.failures + 1
+    delay_seconds = calculate_adaptive_backoff_delay(
+        next_failures,
+        is_timeout=is_otp_timeout_error(error),
+    )
+    return EmailProviderBackoffState(
+        failures=next_failures,
+        delay_seconds=delay_seconds,
+        opened_until=now_ts + delay_seconds,
+        retry_after=getattr(error, "retry_after", None),
+        last_error=str(error),
+    )
+
+
+def reset_adaptive_backoff() -> EmailProviderBackoffState:
+    """重置邮箱供应商退避状态"""
+    return EmailProviderBackoffState()
 
 
 class EmailServiceError(Exception):
     """邮箱服务异常"""
     pass
+
+
+class RateLimitedEmailServiceError(EmailServiceError):
+    """邮箱服务被限流"""
+
+    def __init__(self, message: str, retry_after: Optional[int] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class OTPTimeoutEmailServiceError(EmailServiceError):
+    """OTP 验证码等待超时。"""
+
+    def __init__(self, message: str, error_code: str = OTP_TIMEOUT_ERROR_PREFIX):
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class EmailServiceStatus(Enum):
@@ -45,6 +145,9 @@ class BaseEmailService(abc.ABC):
         self.name = name or f"{service_type.value}_service"
         self._status = EmailServiceStatus.HEALTHY
         self._last_error = None
+        self._provider_backoff = reset_adaptive_backoff()
+
+    _EMAIL_ADDRESS_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
     @property
     def status(self) -> EmailServiceStatus:
@@ -55,6 +158,15 @@ class BaseEmailService(abc.ABC):
     def last_error(self) -> Optional[str]:
         """获取最后一次错误信息"""
         return self._last_error
+
+    @property
+    def provider_backoff_state(self) -> EmailProviderBackoffState:
+        """获取当前邮箱供应商退避状态"""
+        return self._provider_backoff
+
+    def apply_provider_backoff_state(self, state: Optional[EmailProviderBackoffState]) -> None:
+        """注入外部持久化的邮箱供应商退避状态"""
+        self._provider_backoff = state or reset_adaptive_backoff()
 
     @abc.abstractmethod
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -92,7 +204,7 @@ class BaseEmailService(abc.ABC):
             email_id: 邮箱服务中的 ID（如果需要）
             timeout: 超时时间（秒）
             pattern: 验证码正则表达式
-            otp_sent_at: OTP 发送时间戳，用于过滤旧邮件
+            otp_sent_at: OTP 发送时间戳，只允许使用严格晚于该锚点的邮件
 
         Returns:
             验证码字符串，如果超时或未找到返回 None
@@ -161,6 +273,30 @@ class BaseEmailService(abc.ABC):
         for email_info in self.list_emails():
             if email_info.get("id") == email_id:
                 return email_info
+        return None
+
+    def _strip_email_addresses(self, text: str) -> str:
+        """移除文本中的邮箱地址，避免域名数字被误识别为验证码。"""
+        return self._EMAIL_ADDRESS_PATTERN.sub(" ", text or "")
+
+    def _extract_otp_from_text(self, text: str, pattern: Optional[str] = None) -> Optional[str]:
+        """
+        从文本中提取验证码。
+
+        优先语义匹配，再在移除邮箱地址后的文本上做 6 位数字兜底。
+        """
+        if not text:
+            return None
+
+        semantic_match = re.search(OTP_CODE_SEMANTIC_PATTERN, text, re.IGNORECASE)
+        if semantic_match:
+            return semantic_match.group(1)
+
+        fallback_pattern = pattern or OTP_CODE_PATTERN
+        simple_match = re.search(fallback_pattern, self._strip_email_addresses(text))
+        if simple_match:
+            return simple_match.group(1)
+
         return None
 
     def wait_for_email(
@@ -282,8 +418,16 @@ class BaseEmailService(abc.ABC):
         if success:
             self._status = EmailServiceStatus.HEALTHY
             self._last_error = None
+            self._provider_backoff = reset_adaptive_backoff()
         else:
-            self._status = EmailServiceStatus.DEGRADED
+            if isinstance(error, RateLimitedEmailServiceError) or is_otp_timeout_error(error):
+                self._status = EmailServiceStatus.UNAVAILABLE
+                self._provider_backoff = apply_adaptive_backoff(
+                    self._provider_backoff,
+                    error,
+                )
+            else:
+                self._status = EmailServiceStatus.DEGRADED
             if error:
                 self._last_error = str(error)
 

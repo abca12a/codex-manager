@@ -3,16 +3,17 @@
 从 main.py 中提取并重构的注册流程
 """
 
+import base64
+import math
 import re
 import json
 import time
 import base64
 import logging
 import secrets
-import string
 import urllib.parse
 from typing import Optional, Dict, Any, Tuple, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from curl_cffi import requests as cffi_requests
@@ -20,6 +21,7 @@ from curl_cffi import requests as cffi_requests
 from .openai.oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
+from ..services.base import EmailProviderBackoffState
 from ..database import crud
 from ..database.session import get_db
 from ..config.constants import (
@@ -36,6 +38,12 @@ from ..config.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
+
+OTP_SECONDARY_TIMEOUT_SECONDS = 120
+PHASE_EMAIL_PREPARE = "email_prepare"
+PHASE_OTP_SECONDARY = "otp_secondary"
+ERROR_EMAIL_PROVIDER_RATE_LIMITED = "EMAIL_PROVIDER_RATE_LIMITED"
+ERROR_OTP_TIMEOUT_SECONDARY = "OTP_TIMEOUT_SECONDARY"
 
 
 def _decode_auth_cookie_payload(auth_cookie: str) -> Dict[str, Any]:
@@ -144,7 +152,9 @@ class RegistrationResult:
     refresh_token: str = ""
     id_token: str = ""
     session_token: str = ""  # 会话令牌
+    cookies: str = ""  # 浏览器完整 Cookie 字符串
     error_message: str = ""
+    error_code: str = ""
     logs: list = None
     metadata: dict = None
     source: str = "register"  # 'register' 或 'login'，区分账号来源
@@ -161,7 +171,9 @@ class RegistrationResult:
             "refresh_token": self.refresh_token[:20] + "..." if self.refresh_token else "",
             "id_token": self.id_token[:20] + "..." if self.id_token else "",
             "session_token": self.session_token[:20] + "..." if self.session_token else "",
+            "cookies": self.cookies[:20] + "..." if self.cookies else "",
             "error_message": self.error_message,
+            "error_code": self.error_code,
             "logs": self.logs or [],
             "metadata": self.metadata or {},
             "source": self.source,
@@ -188,6 +200,40 @@ class CreateAccountResult:
     error_message: str = ""
 
 
+@dataclass(frozen=True)
+class Budget:
+    """阶段超时预算"""
+
+    timeout_seconds: int
+    started_at: float
+
+    def remaining_seconds(self, now: Optional[float] = None) -> int:
+        current = now if now is not None else time.time()
+        remaining = self.timeout_seconds - max(0.0, current - self.started_at)
+        return max(0, math.ceil(remaining))
+
+
+@dataclass(frozen=True)
+class PhaseContext:
+    """阶段执行上下文"""
+
+    otp_sent_at: Optional[float] = None
+
+
+@dataclass
+class PhaseResult:
+    """阶段执行结果"""
+
+    phase: str
+    success: bool
+    error_message: str = ""
+    error_code: str = ""
+    retryable: bool = False
+    next_action: str = ""
+    provider_backoff: Optional[EmailProviderBackoffState] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 class RegistrationEngine:
     """
     注册引擎
@@ -199,7 +245,8 @@ class RegistrationEngine:
         email_service: BaseEmailService,
         proxy_url: Optional[str] = None,
         callback_logger: Optional[Callable[[str], None]] = None,
-        task_uuid: Optional[str] = None
+        status_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        task_uuid: Optional[str] = None,
     ):
         """
         初始化注册引擎
@@ -208,11 +255,13 @@ class RegistrationEngine:
             email_service: 邮箱服务实例
             proxy_url: 代理 URL
             callback_logger: 日志回调函数
+            status_callback: 状态回调函数
             task_uuid: 任务 UUID（用于数据库记录）
         """
         self.email_service = email_service
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
+        self.status_callback = status_callback
         self.task_uuid = task_uuid
         if hasattr(self.email_service, "debug_callback"):
             setattr(self.email_service, "debug_callback", self._log)
@@ -237,10 +286,12 @@ class RegistrationEngine:
         self.email_info: Optional[Dict[str, Any]] = None
         self.oauth_start: Optional[OAuthStart] = None
         self.session: Optional[cffi_requests.Session] = None
+        self.device_id: Optional[str] = None
         self.session_token: Optional[str] = None  # 会话令牌
         self.logs: list = []
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
+        self.phase_history: list[PhaseResult] = []
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -273,6 +324,101 @@ class RegistrationEngine:
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         """生成随机密码"""
         return ''.join(secrets.choice(PASSWORD_CHARSET) for _ in range(length))
+
+    def _emit_status(self, phase: str, detail: str, **extra):
+        """向外部上报阶段进度。"""
+        if not self.status_callback:
+            return
+
+        payload = {
+            "phase": phase,
+            "phase_detail": detail,
+        }
+        if self.email:
+            payload["email"] = self.email
+        payload.update({key: value for key, value in extra.items() if value is not None})
+
+        try:
+            self.status_callback(payload)
+        except Exception as e:
+            logger.warning(f"上报任务阶段状态失败: {e}")
+
+    def _current_device_id(self) -> Optional[str]:
+        """优先复用现有 Device ID，避免重复触发慢请求。"""
+        if self.device_id:
+            return self.device_id
+        if not self.session:
+            return None
+
+        did = self.session.cookies.get("oai-did")
+        if did:
+            self.device_id = did
+        return did
+
+    def _log_timed_http_result(
+        self,
+        action: str,
+        started_at: float,
+        response: Optional[Any] = None,
+    ):
+        """记录 HTTP 调用的耗时与结果。"""
+        elapsed = max(0.0, time.time() - started_at)
+        parts = [f"{action} 完成，耗时 {elapsed:.1f} 秒"]
+        if response is not None:
+            status_code = getattr(response, "status_code", None)
+            response_url = str(getattr(response, "url", "") or "").strip()
+            if status_code is not None:
+                parts.append(f"HTTP {status_code}")
+            if response_url:
+                parts.append(f"URL: {response_url[:120]}...")
+        self._log("，".join(parts))
+
+    def _record_phase_result(self, phase_result: PhaseResult) -> PhaseResult:
+        self.phase_history = [
+            item for item in self.phase_history
+            if item.phase != phase_result.phase
+        ]
+        self.phase_history.append(phase_result)
+        return phase_result
+
+    def _get_phase_result(self, phase_name: str) -> Optional[PhaseResult]:
+        for phase_result in reversed(self.phase_history):
+            if phase_result.phase == phase_name:
+                return phase_result
+        return None
+
+    def _phase_email_prepare(self) -> bool:
+        success = self._create_email()
+        provider_backoff = getattr(self.email_service, "provider_backoff_state", None)
+
+        if success:
+            self._record_phase_result(
+                PhaseResult(
+                    phase=PHASE_EMAIL_PREPARE,
+                    success=True,
+                    provider_backoff=provider_backoff,
+                )
+            )
+            return True
+
+        error_message = getattr(self.email_service, "last_error", None) or "创建邮箱失败"
+        is_rate_limited = bool(
+            provider_backoff
+            and provider_backoff.failures > 0
+            and provider_backoff.delay_seconds > 0
+        )
+        self._record_phase_result(
+            PhaseResult(
+                phase=PHASE_EMAIL_PREPARE,
+                success=False,
+                error_message=error_message,
+                error_code=ERROR_EMAIL_PROVIDER_RATE_LIMITED if is_rate_limited else "",
+                retryable=is_rate_limited,
+                next_action="switch_provider" if is_rate_limited else "",
+                provider_backoff=provider_backoff,
+            )
+        )
+        return False
 
     def _check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """检查 IP 地理位置"""
@@ -363,10 +509,37 @@ class RegistrationEngine:
             self._log(f"初始化会话失败: {e}", "error")
             return False
 
+    def close(self):
+        """关闭注册流程占用的资源"""
+        if self.session:
+            try:
+                self.session.close()
+            except Exception as e:
+                self._log(f"关闭注册会话失败: {e}", "warning")
+            finally:
+                self.session = None
+
+        try:
+            self.http_client.close()
+        except Exception as e:
+            self._log(f"关闭 HTTP 客户端失败: {e}", "warning")
+
+        close_email_service = getattr(self.email_service, "close", None)
+        if callable(close_email_service):
+            try:
+                close_email_service()
+            except Exception as e:
+                self._log(f"关闭邮箱服务失败: {e}", "warning")
+
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID"""
         if not self.oauth_start:
             return None
+
+        cached_did = self._current_device_id()
+        if cached_did:
+            self._log(f"复用已有 Device ID: {cached_did}")
+            return cached_did
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -374,13 +547,22 @@ class RegistrationEngine:
                 if not self.session:
                     self.session = self.http_client.session
 
+                self._emit_status(
+                    "oauth_device_id",
+                    f"获取 Device ID（第 {attempt}/{max_attempts} 次）",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
+                started_at = time.time()
                 response = self.session.get(
                     self.oauth_start.auth_url,
                     timeout=20
                 )
+                self._log_timed_http_result("获取 Device ID 请求", started_at, response)
                 did = self.session.cookies.get("oai-did")
 
                 if did:
+                    self.device_id = did
                     self._log(f"Device ID: {did}")
                     return did
 
@@ -404,8 +586,15 @@ class RegistrationEngine:
     def _check_sentinel(self, did: str) -> Optional[str]:
         """检查 Sentinel 拦截"""
         try:
-            sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
+            device_id = did or self._current_device_id()
+            if not device_id:
+                self._log("Sentinel 检查跳过: 缺少 Device ID", "warning")
+                return None
 
+            self._emit_status("sentinel", "请求 Sentinel 校验令牌")
+            sen_req_body = f'{{"p":"","id":"{device_id}","flow":"authorize_continue"}}'
+
+            started_at = time.time()
             response = self.http_client.post(
                 OPENAI_API_ENDPOINTS["sentinel"],
                 headers={
@@ -415,6 +604,7 @@ class RegistrationEngine:
                 },
                 data=sen_req_body,
             )
+            self._log_timed_http_result("Sentinel 校验", started_at, response)
 
             if response.status_code == 200:
                 sen_token = response.json().get("token")
@@ -703,7 +893,10 @@ class RegistrationEngine:
         except Exception as e:
             logger.warning(f"标记邮箱状态失败: {e}")
 
-    def _send_verification_code(self) -> bool:
+    def _send_verification_code(
+        self,
+        referer: str = "https://auth.openai.com/create-account/password",
+    ) -> bool:
         """发送验证码"""
         try:
             # 记录发送时间戳
@@ -712,7 +905,7 @@ class RegistrationEngine:
             response = self.session.get(
                 OPENAI_API_ENDPOINTS["send_otp"],
                 headers={
-                    "referer": "https://auth.openai.com/create-account/password",
+                    "referer": referer,
                     "accept": "application/json",
                 },
             )
@@ -726,28 +919,99 @@ class RegistrationEngine:
 
     def _get_verification_code(self) -> Optional[str]:
         """获取验证码"""
+        code, _ = self._phase_otp_secondary(
+            PhaseContext(otp_sent_at=self._otp_sent_at),
+            started_at=time.time(),
+        )
+        return code
+
+    def _phase_otp_secondary(
+        self,
+        context: PhaseContext,
+        started_at: Optional[float] = None,
+    ) -> Tuple[Optional[str], PhaseResult]:
+        """等待二次验证码邮件并做超时归因。"""
         try:
             self._log(f"正在等待邮箱 {self.email} 的验证码...")
 
             email_id = self.email_info.get("service_id") if self.email_info else None
+            budget = Budget(
+                timeout_seconds=OTP_SECONDARY_TIMEOUT_SECONDS,
+                started_at=started_at if started_at is not None else time.time(),
+            )
+            remaining_timeout = budget.remaining_seconds()
+
+            if remaining_timeout <= 0:
+                phase_result = self._record_phase_result(
+                    PhaseResult(
+                        phase=PHASE_OTP_SECONDARY,
+                        success=False,
+                        error_message="等待验证码超时",
+                        error_code=ERROR_OTP_TIMEOUT_SECONDARY,
+                        retryable=True,
+                        next_action="await_email",
+                        metadata={
+                            "budget_started_at": budget.started_at,
+                            "budget_timeout_seconds": budget.timeout_seconds,
+                            "otp_sent_at": context.otp_sent_at,
+                        },
+                    )
+                )
+                self._log(phase_result.error_message, "error")
+                return None, phase_result
+
             code = self.email_service.get_verification_code(
                 email=self.email,
                 email_id=email_id,
-                timeout=120,
+                timeout=remaining_timeout,
                 pattern=OTP_CODE_PATTERN,
-                otp_sent_at=self._otp_sent_at,
+                otp_sent_at=context.otp_sent_at,
             )
 
             if code:
                 self._log(f"成功获取验证码: {code}")
-                return code
-            else:
-                self._log("等待验证码超时", "error")
-                return None
+                phase_result = self._record_phase_result(
+                    PhaseResult(
+                        phase=PHASE_OTP_SECONDARY,
+                        success=True,
+                        metadata={
+                            "budget_started_at": budget.started_at,
+                            "budget_timeout_seconds": budget.timeout_seconds,
+                            "otp_sent_at": context.otp_sent_at,
+                        },
+                    )
+                )
+                return code, phase_result
+
+            phase_result = self._record_phase_result(
+                PhaseResult(
+                    phase=PHASE_OTP_SECONDARY,
+                    success=False,
+                    error_message="等待验证码超时",
+                    error_code=ERROR_OTP_TIMEOUT_SECONDARY,
+                    retryable=True,
+                    next_action="await_email",
+                    metadata={
+                        "budget_started_at": budget.started_at,
+                        "budget_timeout_seconds": budget.timeout_seconds,
+                        "otp_sent_at": context.otp_sent_at,
+                    },
+                )
+            )
+            self._log(phase_result.error_message, "error")
+            return None, phase_result
 
         except Exception as e:
             self._log(f"获取验证码失败: {e}", "error")
-            return None
+            phase_result = self._record_phase_result(
+                PhaseResult(
+                    phase=PHASE_OTP_SECONDARY,
+                    success=False,
+                    error_message=str(e),
+                    metadata={"otp_sent_at": context.otp_sent_at},
+                )
+            )
+            return None, phase_result
 
     def _validate_verification_code(self, code: str) -> bool:
         """验证验证码"""
@@ -933,8 +1197,26 @@ class RegistrationEngine:
     def _get_workspace_id(self) -> Optional[str]:
         """获取 Workspace ID"""
         try:
-            auth_cookie = self.session.cookies.get("oai-client-auth-session")
-            if not auth_cookie:
+            cookie_names = (
+                "oai-client-auth-session",
+                "oai_client_auth_session",
+                "oai-client-auth-info",
+                "oai_client_auth_info",
+            )
+            found_cookie = False
+
+            for cookie_name in cookie_names:
+                auth_cookie = self.session.cookies.get(cookie_name)
+                if not auth_cookie:
+                    continue
+
+                found_cookie = True
+                workspace_id = self._extract_workspace_id_from_cookie(auth_cookie)
+                if workspace_id:
+                    self._log(f"Workspace ID: {workspace_id}")
+                    return workspace_id
+
+            if not found_cookie:
                 self._log("未能获取到授权 Cookie", "error")
                 return None
 
@@ -963,6 +1245,185 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"获取 Workspace ID 失败: {e}", "error")
             return None
+
+    def _extract_workspace_id_from_cookie(self, cookie_value: str) -> Optional[str]:
+        """从授权 Cookie 中提取 Workspace ID。"""
+        for auth_json in self._decode_cookie_json_candidates(cookie_value):
+            workspace_id = self._extract_workspace_id_from_auth_json(auth_json)
+            if workspace_id:
+                return workspace_id
+        return None
+
+    def _extract_workspace_id_from_text(self, text: str) -> Optional[str]:
+        """从 HTML/脚本文本中提取 Workspace ID。"""
+        if not text:
+            return None
+
+        patterns = [
+            r'"workspace_id"\s*:\s*"([^"]+)"',
+            r'"workspaceId"\s*:\s*"([^"]+)"',
+            r'"default_workspace_id"\s*:\s*"([^"]+)"',
+            r'"defaultWorkspaceId"\s*:\s*"([^"]+)"',
+            r'"active_workspace_id"\s*:\s*"([^"]+)"',
+            r'"activeWorkspaceId"\s*:\s*"([^"]+)"',
+            r'"workspace"\s*:\s*\{[^{}]*"id"\s*:\s*"([^"]+)"',
+            r'"default_workspace"\s*:\s*\{[^{}]*"id"\s*:\s*"([^"]+)"',
+            r'"active_workspace"\s*:\s*\{[^{}]*"id"\s*:\s*"([^"]+)"',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                workspace_id = str(match.group(1) or "").strip()
+                if workspace_id:
+                    return workspace_id
+        return None
+
+    def _extract_workspace_id_from_url(self, url: str) -> Optional[str]:
+        """从 URL 查询参数或片段中提取 Workspace ID。"""
+        if not url:
+            return None
+
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(url)
+        for raw_query in (parsed.query, parsed.fragment):
+            query = urllib.parse.parse_qs(raw_query)
+            for key in (
+                "workspace_id",
+                "workspaceId",
+                "default_workspace_id",
+                "active_workspace_id",
+            ):
+                values = query.get(key) or []
+                if values:
+                    workspace_id = str(values[0] or "").strip()
+                    if workspace_id:
+                        return workspace_id
+        return None
+
+    def _decode_cookie_json_candidates(self, cookie_value: str) -> list[Dict[str, Any]]:
+        """尝试从完整 Cookie 或其分段中解码出 JSON。"""
+        decoded_objects = []
+        candidates = [cookie_value]
+
+        if "." in cookie_value:
+            candidates.extend(cookie_value.split("."))
+
+        for candidate in candidates:
+            raw = (candidate or "").strip()
+            if not raw:
+                continue
+
+            pad = "=" * ((4 - (len(raw) % 4)) % 4)
+            try:
+                decoded = base64.urlsafe_b64decode((raw + pad).encode("ascii"))
+            except Exception:
+                continue
+
+            try:
+                payload = json.loads(decoded.decode("utf-8"))
+            except Exception:
+                continue
+
+            if isinstance(payload, dict):
+                decoded_objects.append(payload)
+
+        return decoded_objects
+
+    def _extract_workspace_id_from_auth_json(self, auth_json: Dict[str, Any]) -> Optional[str]:
+        """从解码后的授权 JSON 中提取 Workspace ID。"""
+        workspaces = auth_json.get("workspaces") or []
+        if isinstance(workspaces, list):
+            for workspace in workspaces:
+                if not isinstance(workspace, dict):
+                    continue
+
+                workspace_id = str(workspace.get("id") or "").strip()
+                if workspace_id:
+                    return workspace_id
+
+        for key in (
+            "workspace_id",
+            "workspaceId",
+            "default_workspace_id",
+            "defaultWorkspaceId",
+            "active_workspace_id",
+            "activeWorkspaceId",
+        ):
+            workspace_id = str(auth_json.get(key) or "").strip()
+            if workspace_id:
+                return workspace_id
+
+        for key in (
+            "workspace",
+            "default_workspace",
+            "active_workspace",
+            "defaultWorkspace",
+            "activeWorkspace",
+        ):
+            workspace = auth_json.get(key)
+            if not isinstance(workspace, dict):
+                continue
+
+            workspace_id = str(workspace.get("id") or "").strip()
+            if workspace_id:
+                return workspace_id
+
+        return None
+
+    def _extract_workspace_id_from_response(
+        self,
+        response: Optional[Any] = None,
+        html: Optional[str] = None,
+        url: Optional[str] = None,
+    ) -> Optional[str]:
+        """统一从响应 JSON、HTML、脚本内容和 URL 中提取 Workspace ID。"""
+        response_url = str(getattr(response, "url", "") or "").strip()
+        response_text = html if html is not None else str(getattr(response, "text", "") or "")
+        candidate_url = url or response_url
+
+        if response is not None:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = None
+            workspace_id = self._extract_workspace_id_from_response_payload(payload)
+            if workspace_id:
+                return workspace_id
+
+        for extractor in (
+            lambda: self._extract_workspace_id_from_html(response_text),
+            lambda: self._extract_workspace_id_from_text(response_text),
+            lambda: self._extract_workspace_id_from_url(candidate_url),
+        ):
+            workspace_id = extractor()
+            if workspace_id:
+                return workspace_id
+
+        return None
+
+    def _extract_workspace_id_from_response_payload(self, payload: Any, depth: int = 0) -> Optional[str]:
+        """递归扫描响应载荷中的 Workspace ID。"""
+        if payload is None or depth > 5:
+            return None
+
+        if isinstance(payload, dict):
+            workspace_id = self._extract_workspace_id_from_auth_json(payload)
+            if workspace_id:
+                return workspace_id
+            for value in payload.values():
+                workspace_id = self._extract_workspace_id_from_response_payload(value, depth + 1)
+                if workspace_id:
+                    return workspace_id
+            return None
+
+        if isinstance(payload, list):
+            for item in payload:
+                workspace_id = self._extract_workspace_id_from_response_payload(item, depth + 1)
+                if workspace_id:
+                    return workspace_id
+
+        return None
 
     def _select_workspace(self, workspace_id: str) -> Optional[str]:
         """选择 Workspace"""
@@ -995,6 +1456,334 @@ class RegistrationEngine:
             self._log(f"选择 Workspace 失败: {e}", "error")
             return None
 
+    def _extract_workspace_id_from_html(self, html: str) -> Optional[str]:
+        if not html:
+            return None
+
+        patterns = [
+            r'name="workspace_id"[^>]*value="([^"]+)"',
+            r"name='workspace_id'[^>]*value='([^']+)'",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html)
+            if match:
+                workspace_id = str(match.group(1) or "").strip()
+                if workspace_id:
+                    return workspace_id
+        return None
+
+    def _extract_hidden_input_value(self, html: str, input_name: str) -> Optional[str]:
+        if not html or not input_name:
+            return None
+
+        escaped = re.escape(input_name)
+        patterns = [
+            rf'name="{escaped}"[^>]*value="([^"]+)"',
+            rf"name='{escaped}'[^>]*value='([^']+)'",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html)
+            if match:
+                value = str(match.group(1) or "").strip()
+                if value:
+                    return value
+        return None
+
+    def _extract_consent_verifier(self, url: str) -> Optional[str]:
+        if not url:
+            return None
+
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        values = query.get("consent_verifier") or []
+        if values:
+            return str(values[0] or "").strip() or None
+        return None
+
+    def _try_reenter_login_flow(self) -> bool:
+        if not self.oauth_start:
+            return False
+
+        try:
+            self._emit_status("login_reentry", "重新进入登录流程")
+            did = self._current_device_id()
+            sen_token = self._check_sentinel(did) if did else None
+            self._log("登录重入：请求 authorize 页面以确认当前表单状态")
+            started_at = time.time()
+            response = self.session.get(
+                self.oauth_start.auth_url,
+                timeout=15,
+            )
+            self._log_timed_http_result("登录重入 authorize 页面", started_at, response)
+            html = response.text or ""
+
+            if "/log-in/password" in str(getattr(response, "url", "") or "") or 'action="/log-in/password"' in html:
+                self._log("重新进入登录流程：检测到密码页")
+                return True
+
+            if "/log-in" in str(getattr(response, "url", "") or "") or 'action="/log-in"' in html:
+                login_data = {
+                    "username": {
+                        "kind": "email",
+                        "value": self.email,
+                    }
+                }
+                self._emit_status("login_reentry", "提交邮箱以推进到密码页")
+                self._log("登录重入：提交邮箱到 authorize/continue")
+                started_at = time.time()
+                login_response = self.session.post(
+                    "https://auth.openai.com/api/accounts/authorize/continue",
+                    headers={
+                        "referer": "https://auth.openai.com/log-in",
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                        **(
+                            {
+                                "openai-sentinel-token": json.dumps(
+                                    {
+                                        "p": "",
+                                        "t": "",
+                                        "c": sen_token,
+                                        "id": did,
+                                        "flow": "authorize_continue",
+                                    }
+                                )
+                            }
+                            if sen_token and did
+                            else {}
+                        ),
+                    },
+                    data=json.dumps(login_data),
+                    timeout=15,
+                )
+                self._log_timed_http_result("登录重入邮箱提交", started_at, login_response)
+                login_json = login_response.json() if login_response.status_code == 200 else {}
+                page_type = str((login_json or {}).get("page", {}).get("type") or "").strip()
+                continue_url = str((login_json or {}).get("continue_url") or "").strip()
+                self._log(
+                    f"登录重入响应: page_type={page_type or 'unknown'}, "
+                    f"continue_url={continue_url[:100] + '...' if continue_url else 'none'}"
+                )
+                if continue_url:
+                    try:
+                        self._emit_status("login_reentry", "跟进登录 continue_url")
+                        started_at = time.time()
+                        self.session.get(continue_url, timeout=15)
+                        self._log_timed_http_result("登录重入 continue_url", started_at)
+                    except Exception:
+                        pass
+                if login_response.status_code == 200 and page_type in {"password", "login_password"}:
+                    self._log("重新进入登录流程：已推进到密码页")
+                    return True
+                if login_response.status_code == 200 and "/log-in/password" in continue_url:
+                    self._log("重新进入登录流程：已推进到密码页")
+                    return True
+            return False
+        except Exception as e:
+            self._log(f"重新进入登录流程失败: {e}", "warning")
+            return False
+
+    def _submit_login_password_step(self) -> bool:
+        if not self.email or not self.password:
+            return False
+
+        try:
+            self._emit_status("login_password", "提交登录密码")
+            did = self._current_device_id()
+            sen_token = self._check_sentinel(did) if did else None
+            started_at = time.time()
+            response = self.session.post(
+                "https://auth.openai.com/api/accounts/password/verify",
+                headers={
+                    "referer": "https://auth.openai.com/log-in/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    **(
+                        {
+                            "openai-sentinel-token": json.dumps(
+                                {
+                                    "p": "",
+                                    "t": "",
+                                    "c": sen_token,
+                                    "id": did,
+                                    "flow": "password_verify",
+                                }
+                            )
+                        }
+                        if sen_token and did
+                        else {}
+                    ),
+                },
+                data=json.dumps({
+                    "password": self.password,
+                }),
+                timeout=15,
+            )
+            self._log_timed_http_result("登录密码提交", started_at, response)
+            self._log(f"登录密码提交状态: {response.status_code}")
+            if response.status_code == 200:
+                try:
+                    payload = response.json() or {}
+                except Exception:
+                    payload = {}
+                continue_url = str(payload.get("continue_url") or "").strip()
+                if continue_url:
+                    try:
+                        self._emit_status("login_password", "跟进密码校验 continue_url")
+                        started_at = time.time()
+                        self.session.get(continue_url, timeout=15)
+                        self._log_timed_http_result("密码校验 continue_url", started_at)
+                    except Exception:
+                        pass
+            return response.status_code in (200, 302, 303)
+        except Exception as e:
+            self._log(f"登录密码提交失败: {e}", "warning")
+            return False
+
+    def _submit_login_password_step_and_get_continue_url(self) -> Tuple[bool, Optional[str]]:
+        if not self.email or not self.password:
+            return False, None
+
+        try:
+            did = self._current_device_id()
+            sen_token = self._check_sentinel(did) if did else None
+            response = self.session.post(
+                "https://auth.openai.com/api/accounts/password/verify",
+                headers={
+                    "referer": "https://auth.openai.com/log-in/password",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    **(
+                        {
+                            "openai-sentinel-token": json.dumps(
+                                {
+                                    "p": "",
+                                    "t": "",
+                                    "c": sen_token,
+                                    "id": did,
+                                    "flow": "password_verify",
+                                }
+                            )
+                        }
+                        if sen_token and did
+                        else {}
+                    ),
+                },
+                data=json.dumps({
+                    "password": self.password,
+                }),
+                timeout=15,
+            )
+            self._log(f"登录密码提交状态: {response.status_code}")
+            if response.status_code not in (200, 302, 303):
+                return False, None
+
+            try:
+                payload = response.json() or {}
+            except Exception:
+                payload = {}
+            continue_url = str(payload.get("continue_url") or "").strip() or None
+            if continue_url:
+                try:
+                    self.session.get(continue_url, timeout=15)
+                except Exception:
+                    pass
+            return True, continue_url
+        except Exception as e:
+            self._log(f"登录密码提交失败: {e}", "warning")
+            return False, None
+
+    def _validate_verification_code_and_get_continue_url(self, code: str) -> Tuple[bool, Optional[str]]:
+        try:
+            code_body = f'{{"code":"{code}"}}'
+
+            response = self.session.post(
+                OPENAI_API_ENDPOINTS["validate_otp"],
+                headers={
+                    "referer": "https://auth.openai.com/email-verification",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                data=code_body,
+            )
+
+            self._log(f"验证码校验状态: {response.status_code}")
+            if response.status_code != 200:
+                return False, None
+
+            try:
+                payload = response.json() or {}
+            except Exception:
+                payload = {}
+            continue_url = str(payload.get("continue_url") or "").strip() or None
+            return True, continue_url
+        except Exception as e:
+            self._log(f"验证验证码失败: {e}", "error")
+            return False, None
+
+    def _advance_login_authorization(self) -> Tuple[Optional[str], Optional[str]]:
+        if not self.oauth_start:
+            return None, None
+
+        if not self._init_session():
+            self._log("重新初始化登录会话失败", "warning")
+            return None, None
+
+        self._emit_status("oauth_reentry", "重新初始化 OAuth 登录会话")
+        if not self._start_oauth():
+            self._log("重新开始 OAuth 登录流程失败", "warning")
+            return None, None
+
+        if not self._get_device_id():
+            self._log("重新登录流程获取 Device ID 失败", "warning")
+            return None, None
+
+        if not self._try_reenter_login_flow():
+            self._log("未能重新进入登录流程", "warning")
+            return None, None
+
+        self._otp_sent_at = time.time()
+        self._emit_status("otp_secondary", "等待登录验证码邮件")
+
+        if not self._submit_login_password_step():
+            return None, None
+
+        code = self._get_verification_code()
+        if not code:
+            self._log("登录流程获取验证码失败", "warning")
+            return None, None
+
+        valid, consent_url = self._validate_verification_code_and_get_continue_url(code)
+        if not valid:
+            self._log("登录流程验证码校验失败", "warning")
+            return None, None
+
+        auth_target = consent_url or self.oauth_start.auth_url
+        self._emit_status("workspace_extract", "请求 consent 页面并提取 Workspace ID")
+        self._log(f"请求 consent 页面: {auth_target[:120]}...")
+        started_at = time.time()
+        auth_response = self.session.get(auth_target, timeout=20)
+        self._log_timed_http_result("获取 consent 页面", started_at, auth_response)
+        current_url = str(getattr(auth_response, "url", "") or "")
+        html = auth_response.text or ""
+
+        if "sign-in-with-chatgpt/codex/consent" in current_url or 'action="/sign-in-with-chatgpt/codex/consent"' in html:
+            workspace_id = self._extract_workspace_id_from_response(response=auth_response, html=html, url=current_url)
+            if not workspace_id:
+                self._log("consent 页面缺少 workspace_id，回退到 Cookie 解析路径", "warning")
+                return None, None
+
+            continue_url = self._select_workspace(workspace_id)
+            if not continue_url:
+                return None, None
+
+            callback_url = self._follow_redirects(continue_url)
+            return workspace_id, callback_url
+
+        return None, None
+
     def _follow_redirects(self, start_url: str, start_method: str = "GET") -> Optional[str]:
         """跟随重定向链，寻找回调 URL"""
         try:
@@ -1004,9 +1793,21 @@ class RegistrationEngine:
 
             for i in range(max_redirects):
                 self._log(f"重定向 {i+1}/{max_redirects}: [{current_method}] {current_url[:100]}...")
-
                 request_fn = self.session.post if current_method == "POST" else self.session.get
-                response = request_fn(current_url, allow_redirects=False, timeout=15)
+                self._emit_status(
+                    "redirect_chain",
+                    f"跟随重定向 {i + 1}/{max_redirects}",
+                    redirect_index=i + 1,
+                    redirect_total=max_redirects,
+                    redirect_url=current_url[:200],
+                )
+                started_at = time.time()
+                response = request_fn(
+                    current_url,
+                    allow_redirects=False,
+                    timeout=15
+                )
+                self._log_timed_http_result(f"重定向跳转 {i + 1}/{max_redirects}", started_at, response)
 
                 location = response.headers.get("Location") or ""
 
@@ -1033,6 +1834,7 @@ class RegistrationEngine:
                     break
 
                 next_url = urllib.parse.urljoin(current_url, location)
+                self._log(f"重定向下一跳: {next_url[:100]}...")
 
                 # 检查是否包含回调参数
                 if "code=" in next_url and "state=" in next_url:
@@ -1056,11 +1858,18 @@ class RegistrationEngine:
                 self._log("OAuth 流程未初始化", "error")
                 return None
 
+            self._emit_status("oauth_callback", "处理 OAuth 回调并交换令牌")
             self._log("处理 OAuth 回调...")
+            started_at = time.time()
             token_info = self.oauth_manager.handle_callback(
                 callback_url=callback_url,
                 expected_state=self.oauth_start.state,
                 code_verifier=self.oauth_start.code_verifier
+            )
+            elapsed = max(0.0, time.time() - started_at)
+            self._log(
+                f"OAuth 回调处理完成，耗时 {elapsed:.1f} 秒，"
+                f"account_id={str(token_info.get('account_id') or '').strip() or 'unknown'}"
             )
 
             self._log("OAuth 授权成功")
@@ -1069,6 +1878,9 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
+
+    def _resolved_execution_mode(self) -> str:
+        return "curl_cffi"
 
     def run(self) -> RegistrationResult:
         """
@@ -1092,6 +1904,7 @@ class RegistrationEngine:
 
             # 1. 检查 IP 地理位置
             self._log("1. 检查 IP 地理位置...")
+            self._emit_status("ip_check", "检查 IP 地理位置", step_index=1)
             ip_ok, location = self._check_ip_location()
             if not ip_ok:
                 result.error_message = f"IP 地理位置不支持: {location}"
@@ -1102,26 +1915,36 @@ class RegistrationEngine:
 
             # 2. 创建邮箱
             self._log("2. 创建邮箱...")
-            if not self._create_email():
-                result.error_message = "创建邮箱失败"
+            self._emit_status("email_prepare", "创建邮箱地址", step_index=2)
+            if not self._phase_email_prepare():
+                email_prepare_phase = self._get_phase_result(PHASE_EMAIL_PREPARE)
+                result.error_message = (
+                    email_prepare_phase.error_message
+                    if email_prepare_phase and email_prepare_phase.error_message
+                    else "创建邮箱失败"
+                )
+                result.error_code = email_prepare_phase.error_code if email_prepare_phase else ""
                 return result
 
             result.email = self.email
 
             # 3. 初始化会话
             self._log("3. 初始化会话...")
+            self._emit_status("session_init", "初始化 HTTP 会话", step_index=3)
             if not self._init_session():
                 result.error_message = "初始化会话失败"
                 return result
 
             # 4. 开始 OAuth 流程
             self._log("4. 开始 OAuth 授权流程...")
+            self._emit_status("oauth_start", "开始 OAuth 授权流程", step_index=4)
             if not self._start_oauth():
                 result.error_message = "开始 OAuth 流程失败"
                 return result
 
             # 5. 获取 Device ID
             self._log("5. 获取 Device ID...")
+            self._emit_status("oauth_device_id", "获取 Device ID", step_index=5)
             did = self._get_device_id()
             if not did:
                 result.error_message = "获取 Device ID 失败"
@@ -1129,6 +1952,7 @@ class RegistrationEngine:
 
             # 6. 检查 Sentinel 拦截
             self._log("6. 检查 Sentinel 拦截...")
+            self._emit_status("sentinel", "检查 Sentinel 拦截", step_index=6)
             sen_token = self._check_sentinel(did)
             if sen_token:
                 self._log("Sentinel 检查通过")
@@ -1137,6 +1961,7 @@ class RegistrationEngine:
 
             # 7. 提交注册表单 + 解析响应判断账号状态
             self._log("7. 提交注册表单...")
+            self._emit_status("signup_submit", "提交注册表单", step_index=7)
             signup_result = self._submit_signup_form(did, sen_token)
             if not signup_result.success:
                 result.error_message = f"提交注册表单失败: {signup_result.error_message}"
@@ -1155,6 +1980,7 @@ class RegistrationEngine:
                 self._log("8. [已注册账号] 跳过密码设置，OTP 已自动发送")
             else:
                 self._log("8. 注册密码...")
+                self._emit_status("signup_password", "提交注册密码", step_index=8)
                 password_ok, password = self._register_password()
                 if not password_ok:
                     result.error_message = "注册密码失败"
@@ -1169,19 +1995,29 @@ class RegistrationEngine:
                 self._otp_sent_at = time.time()
             else:
                 self._log("9. 发送验证码...")
+                self._emit_status("otp_send", "发送验证码", step_index=9)
                 if not self._send_verification_code():
                     result.error_message = "发送验证码失败"
                     return result
 
             # 10. 获取验证码
             self._log("10. 等待验证码...")
-            code = self._get_verification_code()
+            self._emit_status("otp_secondary", "等待验证码邮件", step_index=10)
+            otp_phase_started_at = time.time()
+            code, otp_phase = self._phase_otp_secondary(
+                PhaseContext(otp_sent_at=self._otp_sent_at),
+                started_at=otp_phase_started_at,
+            )
             if not code:
-                result.error_message = "获取验证码失败"
+                result.error_message = (
+                    otp_phase.error_message if otp_phase.error_message else "获取验证码失败"
+                )
+                result.error_code = otp_phase.error_code
                 return result
 
             # 11. 验证验证码
             self._log("11. 验证验证码...")
+            self._emit_status("otp_validate", "校验验证码", step_index=11)
             if not self._validate_verification_code(code):
                 result.error_message = "验证验证码失败"
                 return result
@@ -1194,6 +2030,7 @@ class RegistrationEngine:
                 self._log("12. [已注册账号] 跳过创建用户账户")
             else:
                 self._log("12. 创建用户账户...")
+                self._emit_status("account_create", "创建 OpenAI 账户资料", step_index=12)
                 create_account_result = self._create_user_account()
                 if not create_account_result.success:
                     result.error_message = "创建用户账户失败"
@@ -1201,11 +2038,23 @@ class RegistrationEngine:
                 continue_url = create_account_result.continue_url
                 continue_method = create_account_result.continue_method
 
+            next_step = 13
+            callback_url = None
+
             if continue_url:
-                self._log("13. 使用 create_account 返回的 Continue URL...")
-            else:
-                # 13. 获取 Workspace ID
-                self._log("13. 获取 Workspace ID...")
+                self._log(f"{next_step}. 使用 create_account 返回的 Continue URL...")
+            elif not self._is_existing_account:
+                self._log(f"{next_step}. [新账号] 推进 Codex 授权流程...")
+                self._emit_status("oauth_reentry", "推进 Codex 授权流程", step_index=next_step)
+                workspace_id, callback_url = self._advance_login_authorization()
+                if workspace_id and callback_url:
+                    result.workspace_id = workspace_id
+                    next_step += 1
+
+            if not result.workspace_id:
+                # 获取 Workspace ID
+                self._log(f"{next_step}. 获取 Workspace ID...")
+                self._emit_status("workspace_extract", "从授权态提取 Workspace ID", step_index=next_step)
                 workspace_id = self._get_workspace_id()
                 if not workspace_id:
                     result.error_message = "获取 Workspace ID 失败"
@@ -1213,22 +2062,31 @@ class RegistrationEngine:
 
                 result.workspace_id = workspace_id
 
-                # 14. 选择 Workspace
-                self._log("14. 选择 Workspace...")
-                continue_url = self._select_workspace(workspace_id)
+                next_step += 1
+
+                # 选择 Workspace
+                self._log(f"{next_step}. 选择 Workspace...")
+                self._emit_status("workspace_select", "选择 Workspace", step_index=next_step)
+                continue_url = self._select_workspace(result.workspace_id)
                 if not continue_url:
                     result.error_message = "选择 Workspace 失败"
                     return result
 
-            # 15. 跟随重定向链
-            self._log("15. 跟随重定向链...")
-            callback_url = self._follow_redirects(continue_url, continue_method)
-            if not callback_url:
-                result.error_message = "跟随重定向链失败"
-                return result
+                next_step += 1
 
-            # 16. 处理 OAuth 回调
-            self._log("16. 处理 OAuth 回调...")
+                # 跟随重定向链
+                self._log(f"{next_step}. 跟随重定向链...")
+                self._emit_status("redirect_chain", "跟随授权重定向链", step_index=next_step)
+                callback_url = self._follow_redirects(continue_url, continue_method)
+                if not callback_url:
+                    result.error_message = "跟随重定向链失败"
+                    return result
+
+            next_step += 1
+
+            # 处理 OAuth 回调
+            self._log(f"{next_step}. 处理 OAuth 回调...")
+            self._emit_status("oauth_callback", "处理 OAuth 回调", step_index=next_step)
             token_info = self._handle_oauth_callback(callback_url)
             if not token_info:
                 result.error_message = "处理 OAuth 回调失败"
@@ -1274,6 +2132,7 @@ class RegistrationEngine:
                 "proxy_used": self.proxy_url,
                 "registered_at": datetime.now().isoformat(),
                 "is_existing_account": is_existing_login_flow,
+                "registration_mode": self._resolved_execution_mode(),
             }
 
             return result
@@ -1536,6 +2395,7 @@ class RegistrationEngine:
                     access_token=result.access_token,
                     refresh_token=result.refresh_token,
                     id_token=result.id_token,
+                    cookies=result.cookies,
                     proxy_used=self.proxy_url,
                     extra_data=result.metadata,
                     source=result.source

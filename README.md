@@ -1,6 +1,9 @@
 # OpenAI 账号管理系统 v2
 
 管理 OpenAI 账号的 Web UI 系统，支持多种邮箱服务、并发批量注册、代理管理和账号管理。
+
+# 官方拉闸了,改变了授权流程,各位自行研究吧  
+
 > ⚠️ **免责声明**：本工具仅供学习和研究使用，使用本工具产生的一切后果由使用者自行承担。请遵守相关服务的使用条款，不要用于任何违法或不当用途。 如有侵权，请及时联系，会及时删除。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -45,6 +48,7 @@
     - 单个账号导出为独立 `.json` 文件
     - 多个 CPA 账号打包为 `.zip`，每个账号一个独立文件
     - Sub2API 格式所有账号合并为单个 JSON
+  - Codex Auth 格式需先在账号管理中手动执行 `Codex Auth 登录` 成功后才能导出
   - 上传目标（直连不走代理）：
     - **CPA**：支持多服务配置，上传时选择目标服务，可按服务开关将账号实际代理写入 auth file 的 `proxy_url`
     - **Sub2API**：支持多服务配置，标准 sub2api-data 格式
@@ -94,7 +98,7 @@ cp .env.example .env
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `APP_HOST` | 监听主机 | `0.0.0.0` |
-| `APP_PORT` | 监听端口 | `8000` |
+| `APP_PORT` | 监听端口 | `15555` |
 | `APP_ACCESS_PASSWORD` | Web UI 访问密钥 | `admin123` |
 | `APP_DATABASE_URL` | 数据库连接字符串 | `data/database.db` |
 
@@ -103,7 +107,7 @@ cp .env.example .env
 ### 启动 Web UI
 
 ```bash
-# 默认启动（127.0.0.1:8000）
+# 默认启动（0.0.0.0:15555）
 python webui.py
 
 # 指定地址和端口
@@ -143,9 +147,9 @@ docker-compose up -d
 
 ```bash
 docker run -d \
-  -p 1455:1455 \
+  -p 15555:15555 \
   -e WEBUI_HOST=0.0.0.0 \
-  -e WEBUI_PORT=1455 \
+  -e WEBUI_PORT=15555 \
   -e WEBUI_ACCESS_PASSWORD=your_secure_password \
   -v $(pwd)/data:/app/data \
   --name codex-register \
@@ -154,7 +158,7 @@ docker run -d \
 
 环境变量说明：
 - `WEBUI_HOST`: 监听的主机地址 (默认 `0.0.0.0`)
-- `WEBUI_PORT`: 监听的端口 (默认 `1455`)
+- `WEBUI_PORT`: 监听的端口 (默认 `15555`)
 - `WEBUI_ACCESS_PASSWORD`: 设置 Web UI 的访问密码
 - `DEBUG`: 设为 `1` 或 `true` 开启调试模式
 - `LOG_LEVEL`: 日志级别，如 `info`, `debug`
@@ -172,7 +176,7 @@ python webui.py
 
 也支持 `DATABASE_URL`，优先级低于 `APP_DATABASE_URL`。
 
-启动后访问 http://127.0.0.1:8000
+启动后访问 http://127.0.0.1:15555
 
 ## 打包为可执行文件
 
@@ -327,11 +331,11 @@ cd codex-register
 docker-compose up -d
 ```
 
-服务启动后访问 http://localhost:8000
+服务启动后访问 http://localhost:15555
 
 ### 配置说明
 
-**端口映射**：默认 `8000` 端口，可在 `docker-compose.yml` 中修改。
+**端口映射**：默认 `15555` 端口，可在 `docker-compose.yml` 中修改。
 
 **数据持久化**：
 ```yaml
@@ -345,7 +349,7 @@ volumes:
 environment:
   - APP_ACCESS_PASSWORD=mypassword
   - APP_HOST=0.0.0.0
-  - APP_PORT=8000
+  - APP_PORT=15555
 ```
 
 ### 常用命令
@@ -370,8 +374,7 @@ docker-compose build --no-cache
 - CPA / Sub2API / Team Manager 上传始终直连，不走代理；其中 CPA 可选把账号记录的代理写入 auth file 的 `proxy_url`
 - 注册时自动随机生成用户名和生日（年龄范围 18-45 岁）
 - 支付链接生成使用账号 access_token 鉴权，走全局代理配置
-- 无痕浏览器优先使用 playwright（注入 cookie 直达支付页）；未安装时降级为系统 Chrome/Edge 无痕模式
-- 安装完整支付功能：`pip install ".[payment]" && playwright install chromium`（可选）
+- 无痕打开支付页默认调用系统 Chrome/Edge 的隐私模式
 - 订阅状态自动检测调用 `chatgpt.com/backend-api/me`，走全局代理
 - 批量注册并发数上限为 50，线程池大小已相应调整
 

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>系统设置 - OpenAI 注册系统</title>
     <link rel="stylesheet" href="/static/css/style.css?v={{ static_version }}">
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚙️</text></svg>">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ static_version }}">
 </head>
 <body>
     <div class="container">
@@ -95,6 +95,7 @@
                         <h3>代理列表</h3>
                         <div style="display: flex; gap: var(--spacing-sm);">
                             <button class="btn btn-secondary btn-sm" id="test-all-proxies-btn">🔌 测试全部</button>
+                            <button class="btn btn-danger btn-sm" id="delete-disabled-proxies-btn" disabled>🧹 删除禁用项</button>
                             <button class="btn btn-primary btn-sm" id="add-proxy-btn">➕ 添加代理</button>
                         </div>
                     </div>
@@ -115,7 +116,7 @@
                                 </thead>
                                 <tbody id="proxies-table">
                                     <tr>
-                                        <td colspan="7">
+                                        <td colspan="8">
                                             <div class="empty-state">
                                                 <div class="empty-state-icon">🌐</div>
                                                 <div class="empty-state-title">暂无代理</div>
@@ -201,7 +202,7 @@
                 </div>
             </div>
 
-            <!-- 上传服务设置（CPA + Sub2API + Team Manager） -->
+            <!-- 上传服务设置（CPA + Sub2API + Team Manager + NEWAPI） -->
             <div class="tab-content" id="upload-tab">
                 <!-- CPA 服务管理 -->
                 <div class="card" style="margin-top: var(--spacing-lg);">
@@ -276,6 +277,34 @@
                                 </thead>
                                 <tbody id="tm-services-table">
                                     <tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:20px;">加载中...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-top: var(--spacing-lg);">
+                    <div class="card-header">
+                        <h3>🧩 NEWAPI 服务</h3>
+                        <button class="btn btn-primary btn-sm" id="add-newapi-service-btn">+ 添加服务</button>
+                    </div>
+                    <div class="card-body" style="padding: 0;">
+                        <div class="table-container">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width:150px;">名称</th>
+                                        <th>API URL</th>
+                                        <th style="width:90px;text-align:center;">Type</th>
+                                        <th style="width:150px;">Base URL</th>
+                                        <th>Models</th>
+                                        <th style="width:80px;">状态</th>
+                                        <th style="width:60px;text-align:center;">优先级</th>
+                                        <th style="width:220px;">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="newapi-services-table">
+                                    <tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:20px;">加载中...</td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -417,6 +446,64 @@
                                 <button type="submit" class="btn btn-primary">💾 保存</button>
                                 <button type="button" class="btn btn-secondary" id="test-cpa-service-btn">🔌 测试连接</button>
                                 <button type="button" class="btn btn-secondary" id="cancel-cpa-service-btn">取消</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal" id="newapi-service-edit-modal">
+                <div class="modal-content" style="max-width: 500px;">
+                    <div class="modal-header">
+                        <h3 id="newapi-service-modal-title">添加 NEWAPI 服务</h3>
+                        <button class="modal-close" id="close-newapi-service-modal">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="newapi-service-form">
+                            <input type="hidden" id="newapi-service-id">
+                            <div class="form-group">
+                                <label for="newapi-service-name">名称 *</label>
+                                <input type="text" id="newapi-service-name" placeholder="例如: 自建 New API" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="newapi-service-url">API URL *</label>
+                                <input type="text" id="newapi-service-url" placeholder="https://newapi.example.com" required>
+                                <p class="hint">填写 New API 根地址；连接测试为 <code>GET /api/user/login</code>，请求头 <code>Authorization: Bearer</code>（与<a href="https://docs.newapi.pro/zh/docs/api/management/auth" target="_blank" rel="noopener">鉴权说明</a>一致，Token 来自系统访问令牌）</p>
+                            </div>
+                            <div class="form-group">
+                                <label for="newapi-service-key">Root Token / API Key *</label>
+                                <input type="password" id="newapi-service-key" placeholder="编辑时留空则保持原值" autocomplete="new-password">
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="newapi-service-channel-type">渠道 Type</label>
+                                    <input type="number" id="newapi-service-channel-type" value="57" min="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="newapi-service-channel-base-url">渠道 Base URL</label>
+                                    <input type="text" id="newapi-service-channel-base-url" placeholder="留空使用默认">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="newapi-service-channel-models">渠道 Models</label>
+                                <input type="text" id="newapi-service-channel-models" placeholder="逗号分隔模型列表">
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="newapi-service-priority">优先级</label>
+                                    <input type="number" id="newapi-service-priority" value="0" min="0">
+                                    <p class="hint">数字越小优先级越高</p>
+                                </div>
+                                <div class="form-group">
+                                    <label>&nbsp;</label>
+                                    <label style="margin-top:10px;display:flex;align-items:center;gap:8px;">
+                                        <input type="checkbox" id="newapi-service-enabled" checked> 启用
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="form-actions">
+                                <button type="submit" class="btn btn-primary">💾 保存</button>
+                                <button type="button" class="btn btn-secondary" id="cancel-newapi-service-btn">取消</button>
                             </div>
                         </form>
                     </div>

@@ -2,12 +2,22 @@
 数据库 CRUD 操作
 """
 
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Iterable, Set
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import and_, or_, desc, asc, func
 
-from .models import Account, EmailService, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService
+from .models import Account, EmailService, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService, NewapiService
+
+
+TOKEN_FIELD_NAMES = ("access_token", "refresh_token", "id_token", "session_token")
+
+
+def _default_token_sync_status(token_values: Dict[str, Any]) -> str:
+    """根据当前持久化的 token 内容推导同步状态。"""
+    has_token = any(bool(token_values.get(field)) for field in TOKEN_FIELD_NAMES)
+    return "pending" if has_token else "not_ready"
 
 
 # ============================================================================
@@ -27,13 +37,21 @@ def create_account(
     access_token: Optional[str] = None,
     refresh_token: Optional[str] = None,
     id_token: Optional[str] = None,
+    cookies: Optional[str] = None,
     proxy_used: Optional[str] = None,
     expires_at: Optional['datetime'] = None,
     extra_data: Optional[Dict[str, Any]] = None,
     status: Optional[str] = None,
-    source: Optional[str] = None
+    source: Optional[str] = None,
+    token_sync_status: Optional[str] = None,
 ) -> Account:
     """创建新账户"""
+    token_values = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "session_token": session_token,
+    }
     db_account = Account(
         email=email,
         password=password,
@@ -46,12 +64,15 @@ def create_account(
         access_token=access_token,
         refresh_token=refresh_token,
         id_token=id_token,
+        cookies=cookies,
         proxy_used=proxy_used,
         expires_at=expires_at,
         extra_data=extra_data or {},
         status=status or 'active',
         source=source or 'register',
-        registered_at=datetime.utcnow()
+        registered_at=datetime.utcnow(),
+        token_sync_status=token_sync_status or _default_token_sync_status(token_values),
+        token_sync_updated_at=datetime.utcnow(),
     )
     db.add(db_account)
     db.commit()
@@ -108,6 +129,14 @@ def update_account(
     if not db_account:
         return None
 
+    touches_token = any(field in kwargs for field in TOKEN_FIELD_NAMES)
+    if touches_token:
+        persisted_token_values = {
+            field: kwargs.get(field, getattr(db_account, field))
+            for field in TOKEN_FIELD_NAMES
+        }
+        kwargs.setdefault("token_sync_status", _default_token_sync_status(persisted_token_values))
+        kwargs["token_sync_updated_at"] = datetime.utcnow()
     for key, value in kwargs.items():
         if hasattr(db_account, key) and value is not None:
             setattr(db_account, key, value)
@@ -326,6 +355,34 @@ def delete_registration_task(db: Session, task_uuid: str) -> bool:
     return True
 
 
+def fail_incomplete_registration_tasks(db: Session, error_message: str) -> List[str]:
+    """将服务重启后遗留的未完成任务标记为失败"""
+    tasks = db.query(RegistrationTask).filter(
+        RegistrationTask.status.in_(("pending", "running"))
+    ).all()
+
+    if not tasks:
+        return []
+
+    now = datetime.utcnow()
+    cleaned_task_ids: List[str] = []
+    cleanup_log = f"[系统] {error_message}"
+
+    for task in tasks:
+        task.status = "failed"
+        task.error_message = error_message
+        task.completed_at = now
+        if task.logs:
+            if cleanup_log not in task.logs:
+                task.logs = f"{task.logs}\n{cleanup_log}"
+        else:
+            task.logs = cleanup_log
+        cleaned_task_ids.append(task.task_uuid)
+
+    db.commit()
+    return cleaned_task_ids
+
+
 # 为 API 路由添加别名
 get_account = get_account_by_id
 get_registration_task = get_registration_task_by_uuid
@@ -437,9 +494,13 @@ def get_proxies(
     return query.all()
 
 
-def get_enabled_proxies(db: Session) -> List[Proxy]:
+def get_enabled_proxies(db: Session, exclude_ids: Optional[Iterable[int]] = None) -> List[Proxy]:
     """获取所有启用的代理"""
-    return db.query(Proxy).filter(Proxy.enabled == True).all()
+    query = db.query(Proxy).filter(Proxy.enabled == True)
+    excluded: Set[int] = {int(proxy_id) for proxy_id in (exclude_ids or [])}
+    if excluded:
+        query = query.filter(~Proxy.id.in_(excluded))
+    return query.all()
 
 
 def update_proxy(
@@ -471,6 +532,11 @@ def delete_proxy(db: Session, proxy_id: int) -> bool:
     db.commit()
     return True
 
+def delete_disabled_proxies(db: Session) -> int:
+    """删除所有已禁用代理"""
+    deleted = db.query(Proxy).filter(Proxy.enabled == False).delete(synchronize_session=False)
+    db.commit()
+    return deleted
 
 def update_proxy_last_used(db: Session, proxy_id: int) -> bool:
     """更新代理最后使用时间"""
@@ -483,14 +549,18 @@ def update_proxy_last_used(db: Session, proxy_id: int) -> bool:
     return True
 
 
-def get_random_proxy(db: Session) -> Optional[Proxy]:
+def get_random_proxy(db: Session, exclude_ids: Optional[Iterable[int]] = None) -> Optional[Proxy]:
     """随机获取一个启用的代理，优先返回 is_default=True 的代理"""
     import random
+    excluded: Set[int] = {int(proxy_id) for proxy_id in (exclude_ids or [])}
     # 优先返回默认代理
-    default_proxy = db.query(Proxy).filter(Proxy.enabled == True, Proxy.is_default == True).first()
+    default_query = db.query(Proxy).filter(Proxy.enabled == True, Proxy.is_default == True)
+    if excluded:
+        default_query = default_query.filter(~Proxy.id.in_(excluded))
+    default_proxy = default_query.first()
     if default_proxy:
         return default_proxy
-    proxies = get_enabled_proxies(db)
+    proxies = get_enabled_proxies(db, exclude_ids=excluded)
     if not proxies:
         return None
     return random.choice(proxies)
@@ -714,3 +784,92 @@ def delete_tm_service(db: Session, service_id: int) -> bool:
     db.delete(svc)
     db.commit()
     return True
+def create_newapi_service(
+    db: Session,
+    name: str,
+    api_url: str,
+    api_key: str,
+    enabled: bool = True,
+    priority: int = 0,
+    channel_type: int = 57,
+    channel_base_url: str = "",
+    channel_models: str = "gpt-5.4,gpt-5,gpt-5-codex,gpt-5-codex-mini,gpt-5.1,gpt-5.1-codex,gpt-5.1-codex-max,gpt-5.1-codex-mini,gpt-5.2,gpt-5.2-codex,gpt-5.3-codex,gpt-5-openai-compact,gpt-5-codex-openai-compact,gpt-5-codex-mini-openai-compact,gpt-5.1-openai-compact,gpt-5.1-codex-openai-compact,gpt-5.1-codex-max-openai-compact,gpt-5.1-codex-mini-openai-compact,gpt-5.2-openai-compact,gpt-5.2-codex-openai-compact,gpt-5.3-codex-openai-compact",
+) -> NewapiService:
+    svc = NewapiService(
+        name=name,
+        api_url=api_url,
+        api_key=api_key,
+        enabled=enabled,
+        priority=priority,
+        channel_type=channel_type,
+        channel_base_url=channel_base_url,
+        channel_models=channel_models,
+    )
+    db.add(svc)
+    db.commit()
+    db.refresh(svc)
+    return svc
+
+
+def get_newapi_service_by_id(db: Session, service_id: int) -> Optional[NewapiService]:
+    return db.query(NewapiService).filter(NewapiService.id == service_id).first()
+
+
+def get_newapi_services(db: Session, enabled=None):
+    q = db.query(NewapiService)
+    if enabled is not None:
+        q = q.filter(NewapiService.enabled == enabled)
+    return q.order_by(NewapiService.priority.asc(), NewapiService.id.asc()).all()
+
+
+def update_newapi_service(db: Session, service_id: int, **kwargs):
+    svc = get_newapi_service_by_id(db, service_id)
+    if not svc:
+        return None
+    for k, v in kwargs.items():
+        setattr(svc, k, v)
+    db.commit()
+    db.refresh(svc)
+    return svc
+
+
+def delete_newapi_service(db: Session, service_id: int) -> bool:
+    svc = get_newapi_service_by_id(db, service_id)
+    if not svc:
+        return False
+    db.delete(svc)
+    db.commit()
+    return True
+
+def update_outlook_refresh_token(db: Session, service_id: int, email: str, new_refresh_token: str):
+    """更新 EmailService.config 中指定邮箱的 refresh_token"""
+    service = db.query(EmailService).filter(EmailService.id == service_id).first()
+    if not service or not isinstance(service.config, dict):
+        return
+
+    normalized_email = (email or "").strip().lower()
+    if not normalized_email or not isinstance(new_refresh_token, str) or not new_refresh_token:
+        return
+
+    config = dict(service.config)
+    updated = False
+
+    # 单账户格式
+    if str(config.get("email", "")).lower() == normalized_email:
+        config["refresh_token"] = new_refresh_token
+        updated = True
+
+    # 多账户列表格式
+    for acc in config.get("accounts", []):
+        if not isinstance(acc, dict):
+            continue
+        if str(acc.get("email", "")).lower() == normalized_email:
+            acc["refresh_token"] = new_refresh_token
+            updated = True
+
+    if not updated:
+        return
+
+    service.config = config
+    flag_modified(service, "config")
+    db.commit()

@@ -16,7 +16,7 @@ from email.policy import default as email_policy
 from html import unescape
 from typing import Optional, Dict, Any, List
 
-from .base import BaseEmailService, EmailServiceError, EmailServiceType
+from .base import BaseEmailService, EmailServiceError, EmailServiceType, RateLimitedEmailServiceError
 from ..core.http_client import HTTPClient, RequestConfig
 from ..config.constants import OTP_CODE_PATTERN
 
@@ -266,8 +266,19 @@ class TempMailService(BaseEmailService):
                     error_msg = f"{error_msg} - {error_data}"
                 except Exception:
                     error_msg = f"{error_msg} - {response.text[:200]}"
-                self.update_status(False, EmailServiceError(error_msg))
-                raise EmailServiceError(error_msg)
+                retry_after = None
+                if response.status_code == 429:
+                    retry_after_header = response.headers.get("Retry-After")
+                    if retry_after_header:
+                        try:
+                            retry_after = max(1, int(retry_after_header))
+                        except ValueError:
+                            retry_after = None
+                    error = RateLimitedEmailServiceError(error_msg, retry_after=retry_after)
+                else:
+                    error = EmailServiceError(error_msg)
+                self.update_status(False, error)
+                raise error
 
             try:
                 return response.json()
@@ -440,9 +451,8 @@ class TempMailService(BaseEmailService):
                     self._emit_debug(
                         f"检查候选邮件 id={mail_id} created_at={created_preview} subject={subject_preview}"
                     )
-                    match = re.search(pattern, content)
-                    if match:
-                        code = match.group(1)
+                    code = self._extract_otp_from_text(content, pattern)
+                    if code:
                         self._emit_debug(
                             f"命中验证码邮件 id={mail_id} created_at={created_preview} code={code}"
                         )

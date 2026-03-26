@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>注册控制台 - OpenAI 注册系统</title>
     <link rel="stylesheet" href="/static/css/style.css?v={{ static_version }}">
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ static_version }}">
     <style>
         /* 两栏布局 */
         .two-column-layout {
@@ -300,6 +300,15 @@
                                     </label>
                                     <div id="tm-service-select-group" style="display:none; margin-top: 6px; padding-left: 4px;">
                                         <div class="multi-select-dropdown" id="tm-service-select"></div>
+                                    </div>
+
+                                    <!-- NEWAPI -->
+                                    <label style="display: flex; align-items: center; gap: var(--spacing-sm); cursor: pointer; margin-top: 6px;">
+                                        <input type="checkbox" id="auto-upload-newapi">
+                                        <span>上传到 NEWAPI</span>
+                                    </label>
+                                    <div id="newapi-service-select-group" style="display:none; margin-top: 6px; padding-left: 4px;">
+                                        <div class="multi-select-dropdown" id="newapi-service-select"></div>
                                     </div>
                                 </div>
 
