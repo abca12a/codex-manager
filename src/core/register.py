@@ -775,6 +775,16 @@ class RegistrationEngine:
         continue_method = str(response_data.get("method") or "GET").strip().upper() or "GET"
         return continue_url, continue_method
 
+    def _should_bypass_create_account_continue_url(
+        self,
+        create_account_result: CreateAccountResult,
+    ) -> bool:
+        """当 create_account 直接把流程带到 add-phone 时，回退走登录重入链。"""
+        continue_url = str(create_account_result.continue_url or "").strip().lower()
+        response_data = create_account_result.response_data or {}
+        page_type = str((response_data.get("page") or {}).get("type") or "").strip().lower()
+        return page_type == "add_phone" or "/add-phone" in continue_url
+
     def _send_passwordless_login_otp(self, referer_url: str = "") -> bool:
         """已有账号在登录页切换为邮箱 OTP 登录。"""
         try:
@@ -2035,8 +2045,11 @@ class RegistrationEngine:
                 if not create_account_result.success:
                     result.error_message = "创建用户账户失败"
                     return result
-                continue_url = create_account_result.continue_url
-                continue_method = create_account_result.continue_method
+                if self._should_bypass_create_account_continue_url(create_account_result):
+                    self._log("12. create_account 命中 add-phone，改走登录重入授权链", "warning")
+                else:
+                    continue_url = create_account_result.continue_url
+                    continue_method = create_account_result.continue_method
 
             next_step = 13
             callback_url = None

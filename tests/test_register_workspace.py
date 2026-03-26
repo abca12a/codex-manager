@@ -317,6 +317,110 @@ class RegisterWorkspaceTests(unittest.TestCase):
         self.assertEqual(result.workspace_id, "acct-123")
         self.assertEqual(result.password, "password-1")
 
+    def test_run_falls_back_to_login_reentry_when_create_account_hits_add_phone(self):
+        class DummyEngine(RegistrationEngine):
+            def __init__(self):
+                self.email_service = SimpleNamespace(
+                    service_type=SimpleNamespace(value="temp_mail")
+                )
+                self.proxy_url = None
+                self.callback_logger = lambda msg: None
+                self.task_uuid = "task-add-phone"
+                self.http_client = None
+                self.oauth_manager = None
+                self.email = None
+                self.password = None
+                self.email_info = None
+                self.oauth_start = None
+                self.session = SimpleNamespace(
+                    cookies=SimpleNamespace(get=lambda name: None)
+                )
+                self.session_token = None
+                self.logs = []
+                self._otp_sent_at = None
+                self._is_existing_account = False
+
+            def _log(self, message: str, level: str = "info"):
+                self.logs.append((level, message))
+
+            def _check_ip_location(self):
+                return True, "SG"
+
+            def _create_email(self):
+                self.email = "test@example.com"
+                return True
+
+            def _init_session(self):
+                return True
+
+            def _start_oauth(self):
+                self.oauth_start = SimpleNamespace(state="state-add-phone", code_verifier="verifier-add-phone")
+                return True
+
+            def _get_device_id(self):
+                return "did-1"
+
+            def _check_sentinel(self, did: str):
+                return "sentinel-1"
+
+            def _submit_signup_form(self, did: str, sen_token: str):
+                return SignupFormResult(success=True, page_type="create_account_password")
+
+            def _register_password(self):
+                self.password = "password-1"
+                return True, self.password
+
+            def _send_verification_code(self):
+                return True
+
+            def _get_verification_code(self):
+                return "123456"
+
+            def _validate_verification_code(self, code: str):
+                return True
+
+            def _create_user_account(self):
+                return CreateAccountResult(
+                    success=True,
+                    continue_url="https://auth.openai.com/add-phone",
+                    continue_method="GET",
+                    response_data={
+                        "continue_url": "https://auth.openai.com/add-phone",
+                        "page": {"type": "add_phone"},
+                    },
+                )
+
+            def _follow_redirects(self, start_url: str, start_method: str = "GET"):
+                raise AssertionError("add-phone continue_url should not be followed directly")
+
+            def _advance_login_authorization(self):
+                return (
+                    "ws-login-reentry",
+                    "http://localhost:1455/auth/callback?code=test&state=state-add-phone",
+                )
+
+            def _get_workspace_id(self):
+                raise AssertionError("workspace lookup should be skipped")
+
+            def _select_workspace(self, workspace_id: str):
+                raise AssertionError("workspace select should be skipped")
+
+            def _handle_oauth_callback(self, callback_url: str):
+                return {
+                    "account_id": "acct-123",
+                    "access_token": "access-123",
+                    "refresh_token": "refresh-123",
+                    "id_token": "id-123",
+                }
+
+        engine = DummyEngine()
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.account_id, "acct-123")
+        self.assertEqual(result.workspace_id, "ws-login-reentry")
+
     def test_run_existing_account_reuses_email_and_password(self):
         class DummyEngine(RegistrationEngine):
             def __init__(self):
