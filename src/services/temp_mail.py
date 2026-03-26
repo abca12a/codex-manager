@@ -22,6 +22,7 @@ from ..config.constants import OTP_CODE_PATTERN
 
 
 logger = logging.getLogger(__name__)
+OTP_EARLY_DELIVERY_GRACE_SECONDS = 5
 
 
 class TempMailService(BaseEmailService):
@@ -378,6 +379,8 @@ class TempMailService(BaseEmailService):
 
         start_time = time.time()
         seen_mail_ids: set = set()
+        cached_email_info = self._email_cache.get(email, {})
+        mailbox_created_at = self._parse_mail_timestamp(cached_email_info.get("created_at"))
 
         # 优先使用用户级 JWT，回退到 admin API 先注释用户级API
         # cached = self._email_cache.get(email, {})
@@ -435,7 +438,13 @@ class TempMailService(BaseEmailService):
                     subject_preview = subject[:120] or "(empty subject)"
                     created_preview = str(created_raw or "unknown")
 
-                    if otp_sent_at and created_ts and created_ts + 1 < otp_sent_at:
+                    lower_bound = None
+                    if otp_sent_at:
+                        lower_bound = otp_sent_at - OTP_EARLY_DELIVERY_GRACE_SECONDS
+                    if mailbox_created_at is not None:
+                        lower_bound = max(lower_bound, mailbox_created_at) if lower_bound is not None else mailbox_created_at
+
+                    if lower_bound is not None and created_ts and created_ts < lower_bound:
                         seen_mail_ids.add(mail_id)
                         self._emit_debug(
                             f"跳过旧邮件 id={mail_id} created_at={created_preview} subject={subject_preview}"

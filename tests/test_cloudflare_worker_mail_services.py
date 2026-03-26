@@ -1,5 +1,6 @@
 from src.services.freemail import FreemailService
 from src.services.temp_mail import TempMailService
+import src.services.temp_mail as temp_mail_module
 
 
 class FakeResponse:
@@ -58,6 +59,42 @@ def test_temp_mail_ignores_six_digit_domain_when_extracting_code():
     code = service.get_verification_code(
         email="tester@123456.com",
         timeout=1,
+    )
+
+    assert code == "654321"
+
+
+def test_temp_mail_accepts_recent_otp_that_arrives_before_anchor(monkeypatch):
+    service = TempMailService({
+        "base_url": "https://mail.example.com",
+        "admin_password": "admin-secret",
+        "domain": "as1q51f.xyz",
+    })
+    service._email_cache["tester@as1q51f.xyz"] = {
+        "email": "tester@as1q51f.xyz",
+        "created_at": 100.0,
+    }
+    service.http_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "results": [
+                    {
+                        "id": "msg-1",
+                        "source": "OpenAI <otp@tm1.openai.com>",
+                        "subject": "Your ChatGPT code is 654321",
+                        "text": "Enter this temporary verification code to continue: 654321",
+                        "createdAt": "1970-01-01 00:01:43",
+                    }
+                ]
+            }
+        )
+    ])
+    monkeypatch.setattr(temp_mail_module.time, "sleep", lambda _: None)
+
+    code = service.get_verification_code(
+        email="tester@as1q51f.xyz",
+        timeout=1,
+        otp_sent_at=106.0,
     )
 
     assert code == "654321"
